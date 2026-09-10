@@ -13060,6 +13060,7 @@ dependencies = [
  "sp-core 28.0.0",
  "sp-crypto-hashing 0.1.0",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
