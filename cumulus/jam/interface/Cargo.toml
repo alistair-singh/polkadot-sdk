@@ -19,3 +19,4 @@ futures = { workspace = true }
 jam-codec = { workspace = true, features = ["std"] }
 jam-std-common = { workspace = true }
 jam-types = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive", "std"] }

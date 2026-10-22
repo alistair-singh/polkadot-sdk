@@ -4827,13 +4827,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "cumulus-aura-authorizer"
+name = "cumulus-aura-authorizer-utils"
 version = "0.1.0"
 dependencies = [
  "binary-merkle-tree 16.1.1",
+ "blake2b_simd",
  "hash-db",
  "hash256-std-hasher",
- "jam-types 0.1.28",
+ "jam-codec",
+ "jam-types",
  "parity-scale-codec",
  "polkadot-parachain-primitives 23.0.0",
  "primitive-types 0.13.1",
@@ -5059,8 +5061,8 @@ dependencies = [
  "futures",
  "futures-timer",
  "jam-codec",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "parachain-service-core",
  "parity-scale-codec",
  "rand 0.8.5",
@@ -5244,8 +5246,9 @@ dependencies = [
  "async-trait",
  "futures",
  "jam-codec",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
+ "serde",
 ]
 
 [[package]]
@@ -5257,8 +5260,8 @@ dependencies = [
  "bytes",
  "cumulus-jam-interface",
  "futures",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "jsonrpsee 0.26.0",
  "serde",
  "serde_json",
@@ -5290,8 +5293,8 @@ dependencies = [
  "cumulus-zombienet-sdk-helpers",
  "env_logger 0.11.3",
  "jam-null-authorizer-bin",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "jsonrpsee 0.24.11",
  "jsonrpsee 0.26.0",
  "log",
@@ -5362,7 +5365,7 @@ dependencies = [
  "hex-literal",
  "impl-trait-for-tuples",
  "jam-codec",
- "jam-types 0.1.29",
+ "jam-types",
  "log",
  "pallet-message-queue",
  "parachain-service-core",
@@ -5956,8 +5959,8 @@ dependencies = [
  "cumulus-jam-rpc-interface",
  "cumulus-primitives-core",
  "futures",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "jsonrpsee 0.24.11",
  "log",
  "parachain-service-core",
@@ -9694,11 +9697,13 @@ dependencies = [
 [[package]]
 name = "jam-chainspec"
 version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6181a74992a0d619b816cd1c9d7ff39bc36a93ff4de7ab8fa462468ce13b9469"
 dependencies = [
  "bounded-collections 0.3.2",
  "jam-codec",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "log",
  "serde",
  "serde_json",
@@ -9737,44 +9742,27 @@ dependencies = [
 [[package]]
 name = "jam-null-authorizer-bin"
 version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12a0f551ee2034a779225959d22d144810a2882e6832e3267adf48f2d49ee576"
 
 [[package]]
 name = "jam-pvm-common"
 version = "0.1.29"
-dependencies = [
- "bounded-collections 0.3.2",
- "jam-codec",
- "jam-types 0.1.29",
- "picoalloc",
- "polkavm-derive 0.36.0",
-]
-
-[[package]]
-name = "jam-std-common"
-version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c031759ed9963e42b5cc7d9a0ff3c62bb1ad4f05e30ba42e6019f56317b8bad"
+checksum = "fc9b584b9b343ce25ddf3e01bc4ef95e444de3a188d231c386ccd3d0bc0a8fa8"
 dependencies = [
- "ark-vrf 0.2.2",
- "async-trait",
- "blake2b_simd",
  "bounded-collections 0.3.2",
- "bytes",
- "ed25519-consensus",
- "futures",
  "jam-codec",
- "jam-types 0.1.28",
- "jsonrpsee 0.26.0",
- "rand 0.9.0",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tiny-keccak",
+ "jam-types",
+ "picoalloc",
+ "polkavm-derive 0.37.0",
 ]
 
 [[package]]
 name = "jam-std-common"
 version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f00e8d8a91334cf68e91fb1dcd0a815909a94b83d71041af3c3510cd29f45ea"
 dependencies = [
  "ark-vrf 0.2.2",
  "arrayvec 0.7.8",
@@ -9786,7 +9774,7 @@ dependencies = [
  "ed25519-consensus",
  "futures",
  "jam-codec",
- "jam-types 0.1.29",
+ "jam-types",
  "jsonrpsee 0.26.0",
  "p256",
  "rand 0.9.0",
@@ -9799,22 +9787,9 @@ dependencies = [
 
 [[package]]
 name = "jam-types"
-version = "0.1.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "658ebd3553ff9639a66d4d42b62b6a4c5a0d31923c36aa90a2dbf243545126ca"
-dependencies = [
- "atomic-traits",
- "base64 0.22.1",
- "bounded-collections 0.3.2",
- "bytes",
- "jam-codec",
- "macro_rules_attribute",
- "serde",
-]
-
-[[package]]
-name = "jam-types"
 version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3786d33c67f2a29311a5d21781f828de51a1fbb34dc6362f4039dea11786bab9"
 dependencies = [
  "atomic-traits",
  "base64 0.22.1",
@@ -15851,9 +15826,9 @@ name = "parachain-authorizer"
 version = "0.1.0"
 dependencies = [
  "blake2b_simd",
- "cumulus-aura-authorizer",
+ "cumulus-aura-authorizer-utils",
  "jam-pvm-common",
- "jam-types 0.1.29",
+ "jam-types",
  "parachain-service-core",
  "parity-scale-codec",
  "primitive-types 0.13.1",
@@ -15865,7 +15840,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "jam-pvm-common",
- "jam-types 0.1.29",
+ "jam-types",
  "parachain-authorizer",
  "polkavm-derive 0.36.0",
 ]
@@ -15875,7 +15850,7 @@ name = "parachain-authorizer-sr25519"
 version = "0.1.0"
 dependencies = [
  "jam-pvm-common",
- "jam-types 0.1.29",
+ "jam-types",
  "parachain-authorizer",
  "polkavm-derive 0.36.0",
  "schnorrkel 0.11.5",
@@ -15885,10 +15860,10 @@ dependencies = [
 name = "parachain-chain-spec"
 version = "0.1.0"
 dependencies = [
- "cumulus-aura-authorizer",
+ "cumulus-aura-authorizer-utils",
  "jam-chainspec",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "parachain-service",
  "parachain-service-core",
  "parity-scale-codec",
@@ -15900,11 +15875,11 @@ name = "parachain-service"
 version = "0.1.0"
 dependencies = [
  "bounded-collections 0.3.2",
- "cumulus-aura-authorizer",
+ "cumulus-aura-authorizer-utils",
  "jam-codec",
  "jam-pvm-common",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "parachain-service-core",
  "parity-scale-codec",
  "polkavm 0.36.0",
@@ -15917,9 +15892,9 @@ name = "parachain-service-core"
 version = "0.1.0"
 dependencies = [
  "bounded-collections 0.3.2",
- "cumulus-aura-authorizer",
+ "cumulus-aura-authorizer-utils",
  "jam-pvm-common",
- "jam-types 0.1.29",
+ "jam-types",
  "num_enum",
  "parity-scale-codec",
  "polkadot-parachain-primitives 23.0.0",
@@ -17682,8 +17657,8 @@ dependencies = [
  "futures",
  "futures-timer",
  "jam-codec",
- "jam-std-common 0.1.29",
- "jam-types 0.1.29",
+ "jam-std-common",
+ "jam-types",
  "jsonrpsee 0.24.11",
  "log",
  "nix 0.29.0",
@@ -19184,6 +19159,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "polkavm-common"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b44940b0d82ff491647139e045e026b98666be87770f72d48d6463fb65b866fd"
+dependencies = [
+ "picosimd",
+]
+
+[[package]]
 name = "polkavm-derive"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19208,6 +19192,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "41a7a5487e76bf90e7fce09d6bc1c4c41d2e8c817909b4c29ee1bdca2d338601"
 dependencies = [
  "polkavm-derive-impl-macro 0.36.0",
+]
+
+[[package]]
+name = "polkavm-derive"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b155c82c47af761e7450e1e5eff1d48ad78d040b09ed57b93bc8e46ca4ad71b0"
+dependencies = [
+ "polkavm-derive-impl-macro 0.37.0",
 ]
 
 [[package]]
@@ -19247,6 +19240,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "polkavm-derive-impl"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0f385d969918c91b2f89646b5e77e43cd3f52178e3ed642eec2365f9bc3c575"
+dependencies = [
+ "polkavm-common 0.37.0",
+ "proc-macro2 1.0.107",
+ "quote 1.0.40",
+ "syn 2.0.98",
+]
+
+[[package]]
 name = "polkavm-derive-impl-macro"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -19273,6 +19278,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dc5c392278508d85fa6073423470b56faad2438bf33874cc71444cf3c8b279a"
 dependencies = [
  "polkavm-derive-impl 0.36.0",
+ "syn 2.0.98",
+]
+
+[[package]]
+name = "polkavm-derive-impl-macro"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d89dbb6c2d1a7c951dc8e70bf1302329939a3c21f757861d97e013f8352c8f7"
+dependencies = [
+ "polkavm-derive-impl 0.37.0",
  "syn 2.0.98",
 ]
 
@@ -32075,8 +32090,8 @@ dependencies = [
  "futures",
  "glob-match",
  "hex",
- "jam-std-common 0.1.28",
- "jam-types 0.1.28",
+ "jam-std-common",
+ "jam-types",
  "libp2p",
  "libsecp256k1",
  "multiaddr",

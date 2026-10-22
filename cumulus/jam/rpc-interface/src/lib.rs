@@ -37,7 +37,10 @@ use cumulus_jam_interface::{
 use futures::{channel::mpsc, future::Future, StreamExt};
 use jam_std_common::{Node, NodeExt};
 use jam_types::AnyBytes;
-use jsonrpsee_jam::{core::client::ClientT, rpc_params};
+use jsonrpsee_jam::{
+	core::client::{ClientT, Subscription, SubscriptionClientT},
+	rpc_params,
+};
 use std::time::{Duration, Instant};
 use url::Url;
 use worker::WorkerMessage;
@@ -146,7 +149,10 @@ impl JamChainSource for JamRpcInterface {
 #[async_trait]
 impl JamStateSource for JamRpcInterface {
 	async fn state_value(&self, at: HeaderHash, key: StorageKey) -> Result<Option<Vec<u8>>> {
-		Ok(self.client.state_value(at, key).await?.map(Into::into))
+		// `stateValue` is not in `jam-std-common` 0.1.29's `Node` trait, so this is a raw call.
+		let value: Option<AnyBytes> =
+			ClientT::request(&self.client, "stateValue", rpc_params![at, key]).await?;
+		Ok(value.map(|value| value.0.into()))
 	}
 
 	async fn state_value_stream(
@@ -157,7 +163,7 @@ impl JamStateSource for JamRpcInterface {
 		Ok(resubscribing_value_stream(
 			format!("stateValue({key:?})"),
 			self.client.clone(),
-			move |client| Box::pin(client.subscribe_state_value(key, finalized)),
+			move |client| subscribe_state_value(client, key, finalized),
 		))
 	}
 
@@ -168,7 +174,13 @@ impl JamStateSource for JamRpcInterface {
 		end_key: StorageKey,
 		size_limit: u32,
 	) -> Result<RangeProof> {
-		self.client.state_proof(at, start_key, end_key, size_limit).await
+		// `stateProof` is not in `jam-std-common` 0.1.29's `Node` trait, so this is a raw call.
+		Ok(ClientT::request(
+			&self.client,
+			"stateProof",
+			rpc_params![at, start_key, end_key, size_limit],
+		)
+		.await?)
 	}
 
 	async fn service_value(
@@ -241,7 +253,11 @@ impl JamWorkPackageSubmission for JamRpcInterface {
 		report_hash: WorkReportHash,
 		assurance_epoch: EpochIndex,
 	) -> Result<Vec<u8>> {
-		Ok(self.client.recover_bundle(report_hash, assurance_epoch).await?.into())
+		// `recoverBundle` is not in `jam-std-common` 0.1.29's `Node` trait, so this is a raw call.
+		let bundle: AnyBytes =
+			ClientT::request(&self.client, "recoverBundle", rpc_params![report_hash, assurance_epoch])
+				.await?;
+		Ok(bundle.0.into())
 	}
 
 	async fn work_package_status_stream(
@@ -308,6 +324,26 @@ impl JamWorkPackageSubmission for JamRpcInterface {
 		};
 		Ok(stream.boxed())
 	}
+}
+
+/// `subscribeStateValue` as a raw subscription: `jam-std-common` 0.1.29's `Node` trait does not
+/// have it. Shaped like that trait's `subscribe_service_value`.
+fn subscribe_state_value(
+	client: &JamRpcClient,
+	key: StorageKey,
+	finalized: bool,
+) -> futures::future::BoxFuture<'_, Result<jam_std_common::ChainSub<'_, Option<bytes::Bytes>>>> {
+	Box::pin(async move {
+		let subscription: Subscription<ChainSubUpdate<Option<AnyBytes>>> =
+			SubscriptionClientT::subscribe(
+				client,
+				"subscribeStateValue",
+				rpc_params![key, finalized],
+				"unsubscribeStateValue",
+			)
+			.await?;
+		Ok(subscription.map(|update| Ok(update?.map_some(Into::into))).boxed())
+	})
 }
 
 /// A value-following stream that re-subscribes forever: on subscription errors or a dead

@@ -2414,7 +2414,7 @@ mod tests {
 		node[32..].copy_from_slice(&parachain_service_core::blake2_256(value));
 		let state_root = parachain_service_core::blake2_256(&node);
 		let proof = jam_interface::RangeProof {
-			nodes: vec![jam_std_common::ProofNode::from(node)],
+			nodes: vec![jam_interface::ProofNode::from(node)],
 			values: vec![(
 				StorageKey(state_key),
 				jam_types::AnyBytes::from(bytes::Bytes::from(value.to_vec())),
