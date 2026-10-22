@@ -29,7 +29,7 @@
 pub use futures::stream::BoxStream;
 pub use jam_std_common::{
 	AuthPool, AuthPools, AuthQueues, AvailabilityAssignment, AvailabilityAssignments, BlockDesc,
-	BlockInfo, ChainSubUpdate, EpochIndex, NodeError as Error, NodeResult as Result, RangeProof,
+	BlockInfo, ChainSubUpdate, EpochIndex, NodeError as Error, NodeResult as Result,
 	ReadyQueue, ReadyRecord, RecentBlocks, Service, ServiceKey, StorageKey, SystemKey,
 	VersionedParameters, WorkPackageStatus, WorkReport,
 };
@@ -37,6 +37,32 @@ pub use jam_types::{
 	AuthorizerHash, CoreIndex, Hash, HeaderHash, MmrPeakHash, ServiceId, Slot, StateRootHash,
 	WorkPackage, WorkPackageHash, WorkReportHash,
 };
+
+pub use proof_node::ProofNode;
+
+// Its own module: the `opaque!` expansion names `codec`, `opaque!`, `Result` and `Error`
+// unqualified, and this crate re-exports polkajam's `Result` / `Error` above.
+mod proof_node {
+	use jam_codec as codec;
+	use jam_types::opaque;
+
+	opaque! {
+		/// One node of a JAM state trie proof, as polkajam's `stateProof` returns it.
+		pub struct ProofNode(pub [u8; 64]);
+	}
+}
+
+/// polkajam's `stateProof` result: the trie nodes on the paths to the covered keys, and the values
+/// under them. `jam-std-common` 0.1.29 on crates.io does not export it, so it is mirrored here
+/// field for field from `jam_std_common::node::RangeProof` (read from the node binary's debug
+/// info); its JSON form is the serde derive of exactly this shape.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RangeProof {
+	/// The trie nodes on the paths to the covered keys.
+	pub nodes: Vec<ProofNode>,
+	/// The covered keys and the values under them.
+	pub values: Vec<(StorageKey, jam_types::AnyBytes)>,
+}
 
 use jam_codec::DecodeAll;
 
