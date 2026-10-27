@@ -59,6 +59,8 @@ cumulus-test-runtime = { workspace = true }
 cumulus-jam-zombienet-tests = { path = "../jam-tests", optional = true }
 # The key/value storage key the KV round-trip test reads back.
 pallet-jam-kv = { workspace = true, default-features = true, optional = true }
+# The Parachain Service's own state-key derivation and proof verification.
+parachain-service-core = { path = "../../../../parachain-service/core", features = ["std"], optional = true }
 
 [features]
 zombie-ci = []
@@ -69,4 +71,5 @@ jam = [
 	"cumulus-zombienet-sdk-helpers/jam",
 	"dep:cumulus-jam-zombienet-tests",
 	"dep:pallet-jam-kv",
+	"dep:parachain-service-core",
 ]

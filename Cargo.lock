@@ -5998,6 +5998,7 @@ dependencies = [
  "log",
  "multihash",
  "pallet-jam-kv",
+ "parachain-service-core",
  "parity-scale-codec",
  "parity-wasm",
  "polkadot-primitives",

@@ -156,6 +156,38 @@ impl JamRpc {
 	}
 }
 
+/// Proofs of single state items, in the form the Parachain Service verifies.
+#[cfg(feature = "jam")]
+impl JamRpc {
+	/// The posterior state root of block `at`.
+	pub async fn state_root(&self, at: &Value) -> anyhow::Result<[u8; 32]> {
+		let root: AnyHash =
+			self.client.request("stateRoot", rpc_params![at]).await.context("stateRoot")?;
+		Ok(root.0)
+	}
+
+	/// A proof of the state item `key` at block `at`, converted the way the collator converts the
+	/// proofs it carries, so `parachain_service_core::verify` checks it as refine would.
+	pub async fn state_proof(
+		&self,
+		at: &Value,
+		key: &[u8; 31],
+	) -> anyhow::Result<parachain_service_core::StateProof> {
+		/// One key's proof is bounded by the trie depth; the collator uses the same bound.
+		const PROOF_SIZE_LIMIT: u32 = 64 * 1024;
+		let key = cumulus_jam_interface::StorageKey(*key);
+		let proof: cumulus_jam_interface::RangeProof = self
+			.client
+			.request("stateProof", rpc_params![at, key, key, PROOF_SIZE_LIMIT])
+			.await
+			.context("stateProof")?;
+		Ok(parachain_service_core::StateProof {
+			nodes: proof.nodes.iter().map(|node| **node).collect(),
+			values: proof.values.iter().map(|(key, value)| (**key, value.to_vec())).collect(),
+		})
+	}
+}
+
 /// How long the whole preimage step may take, covering both waits below. The request only
 /// appears once the upgrade block accumulates and the provision only lands at a later finalized
 /// block, so this is a few slots on a healthy network; the bound is loose enough for a loaded CI

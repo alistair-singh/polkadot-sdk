@@ -22,6 +22,10 @@
 //! carried the call. The test writes a value with sudo, reads it back with `serviceValue` under
 //! `0x08 ‖ para_id ‖ key`, then removes it and waits for the entry to go. This is the path the
 //! bootnode record will be published on.
+//!
+//! After each change the test also proves the entry the way a trustless reader would: it fetches
+//! `stateRoot` and `stateProof` at one JAM block and checks the proof with the Parachain Service's
+//! own `verify`, for the value after `set_kv` and for its absence after `remove_kv`.
 
 use anyhow::Context;
 use codec::Encode;
@@ -68,6 +72,7 @@ async fn kv_round_trip_works() -> Result<(), anyhow::Error> {
 		)
 		.await?;
 		wait_for_value(&jam, &key, Some(VALUE)).await?;
+		assert_proven(&jam, &key, Some(VALUE)).await?;
 
 		// The key with a SCALE length prefix, as a reader might wrongly build it, finds nothing.
 		let prefixed = kv_storage_key(para.id, &KEY.to_vec().encode());
@@ -76,7 +81,8 @@ async fn kv_round_trip_works() -> Result<(), anyhow::Error> {
 		anyhow::ensure!(stored.is_none(), "the length-prefixed key found {stored:?}");
 
 		submit_jam_kv(&jam, &para, "remove_kv", vec![Value::from_bytes(KEY)]).await?;
-		wait_for_value(&jam, &key, None).await
+		wait_for_value(&jam, &key, None).await?;
+		assert_proven(&jam, &key, None).await
 	}
 	.await;
 
@@ -130,4 +136,30 @@ async fn wait_for_value(
 		);
 		tokio::time::sleep(Duration::from_secs(6)).await;
 	}
+}
+
+/// Prove what the service stores under `key` at JAM's best block: fetch the block's state root
+/// and a proof of the entry's state key, and check the proof with the service's own `verify`.
+async fn assert_proven(
+	jam: &JamNetwork,
+	key: &[u8],
+	expected: Option<&[u8]>,
+) -> anyhow::Result<()> {
+	let state_key = parachain_service_core::service_value_state_key(PARACHAIN_SERVICE_ID, key);
+	let at = jam.jam_rpc.best_block_hash().await?;
+	let state_root = jam.jam_rpc.state_root(&at).await?;
+	let proof = jam.jam_rpc.state_proof(&at, &state_key).await?;
+	let proven = parachain_service_core::verify(&proof, &state_root, &state_key)
+		.map_err(|error| anyhow::anyhow!("the stateProof does not verify: {error:?}"))?;
+	anyhow::ensure!(
+		proven.as_deref() == expected,
+		"the proof at {at} proves {proven:?}, expected {expected:?}"
+	);
+	log::info!(
+		"stateProof at {at}: {} nodes prove {:?} under state key 0x{}",
+		proof.nodes.len(),
+		expected.map(String::from_utf8_lossy),
+		hex::encode(state_key),
+	);
+	Ok(())
 }
