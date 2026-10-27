@@ -5997,6 +5997,7 @@ dependencies = [
  "hex",
  "log",
  "multihash",
+ "pallet-jam-kv",
  "parity-scale-codec",
  "parity-wasm",
  "polkadot-primitives",
@@ -13973,6 +13974,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-jam-kv"
+version = "0.1.0"
+dependencies = [
+ "cumulus-jam-state-reader",
+ "frame-support",
+ "frame-system",
+ "parachain-service-core",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-io 30.0.0",
+ "sp-runtime 31.0.1",
+]
+
+[[package]]
 name = "pallet-lottery"
 version = "28.0.0"
 dependencies = [
@@ -15935,6 +15950,7 @@ dependencies = [
  "docify",
  "hex-literal",
  "log",
+ "pallet-jam-kv",
  "pallet-parachain-template",
  "parity-scale-codec",
  "polkadot-sdk",

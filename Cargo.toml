@@ -81,6 +81,7 @@ members = [
 	"cumulus/client/service",
 	"cumulus/jam/interface",
 	"cumulus/jam/pallet-jam-broker",
+	"cumulus/jam/pallet-jam-kv",
 	"cumulus/jam/rpc-interface",
 	"cumulus/jam/state-reader",
 	"cumulus/pallets/ah-ops",
@@ -805,6 +806,7 @@ cumulus-jam-interface = { path = "cumulus/jam/interface", default-features = fal
 cumulus-jam-rpc-interface = { path = "cumulus/jam/rpc-interface", default-features = false }
 cumulus-jam-state-reader = { path = "cumulus/jam/state-reader", default-features = false }
 pallet-jam-broker = { path = "cumulus/jam/pallet-jam-broker", default-features = false }
+pallet-jam-kv = { path = "cumulus/jam/pallet-jam-kv", default-features = false }
 cumulus-pallet-aura-ext = { path = "cumulus/pallets/aura-ext", default-features = false }
 cumulus-pallet-parachain-system = { path = "cumulus/pallets/parachain-system", default-features = false }
 cumulus-pallet-parachain-system-proc-macro = { path = "cumulus/pallets/parachain-system/proc-macro", default-features = false }

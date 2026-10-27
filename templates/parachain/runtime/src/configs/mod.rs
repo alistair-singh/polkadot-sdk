@@ -363,3 +363,26 @@ impl pallet_parachain_template::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type WeightInfo = pallet_parachain_template::weights::SubstrateWeight<Runtime>;
 }
+
+/// This para's id as the `u32` the Parachain Service's messages carry.
+#[cfg(jam)]
+pub struct SelfParaIdU32;
+
+#[cfg(jam)]
+impl frame_support::traits::Get<u32> for SelfParaIdU32 {
+	fn get() -> u32 {
+		parachain_info::Pallet::<Runtime>::parachain_id().into()
+	}
+}
+
+/// Root writes the para's key/value storage in the Parachain Service. The per-block cap leaves
+/// most of the service's 40 KiB per-refine upward-message budget to other senders.
+#[cfg(jam)]
+impl pallet_jam_kv::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type SelfParaId = SelfParaIdU32;
+	type MaxKeyLen = ConstU32<128>;
+	type MaxValueLen = ConstU32<4096>;
+	type MaxBytesPerBlock = ConstU32<{ 16 * 1024 }>;
+}

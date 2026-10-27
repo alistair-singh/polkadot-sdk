@@ -1,0 +1,133 @@
+// This file is part of Cumulus.
+
+// Copyright (C) Parity Technologies (UK) Ltd.
+// SPDX-License-Identifier: Apache-2.0
+
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// 	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A para's key/value storage round-trips through JAM.
+//!
+//! `JamKv::set_kv` sends a `SetKV` upward message that only the PVF delivers, so the value can
+//! appear in the Parachain Service's storage only after JAM refined and accumulated the block that
+//! carried the call. The test writes a value with sudo, reads it back with `serviceValue` under
+//! `0x08 ‖ para_id ‖ key`, then removes it and waits for the entry to go. This is the path the
+//! bootnode record will be published on.
+
+use anyhow::Context;
+use codec::Encode;
+use cumulus_jam_zombienet_tests::{
+	network::wait_for_collators,
+	para::{Para, DEADLINE, PARACHAIN_SERVICE_ID, TINY_CORES},
+	spawn::{spawn, JamNetwork, SpawnOptions},
+};
+use cumulus_zombienet_sdk_helpers::{
+	coretime::sudo_call, submit_extrinsic_and_wait_for_best_block_success,
+};
+use pallet_jam_kv::kv_storage_key;
+use std::time::{Duration, Instant};
+use zombienet_sdk::{
+	subxt::{dynamic::Value, tx::dynamic},
+	subxt_signer::sr25519::dev,
+};
+
+const KEY: &[u8] = b"jam-kv-roundtrip";
+const VALUE: &[u8] = b"value written by the para runtime";
+
+/// The para must be producing blocks before a call can land in one.
+const BLOCKS: u64 = 5;
+const FINALIZED: u64 = 2;
+
+/// Budget for a write to reach JAM: inclusion, refine, availability and accumulation.
+const KV_BUDGET: Duration = Duration::from_secs(4 * 60);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_round_trip_works() -> Result<(), anyhow::Error> {
+	let para = Para::single(1);
+	let jam =
+		spawn("kv_round_trip_works", &[Para::single(1)], SpawnOptions::new(TINY_CORES)).await?;
+	let result = async {
+		wait_for_collators(&jam.network, &[Para::single(1)], BLOCKS, FINALIZED, DEADLINE.as_secs())
+			.await?;
+		let key = kv_storage_key(para.id, KEY);
+
+		submit_jam_kv(
+			&jam,
+			&para,
+			"set_kv",
+			vec![Value::from_bytes(KEY), Value::from_bytes(VALUE)],
+		)
+		.await?;
+		wait_for_value(&jam, &key, Some(VALUE)).await?;
+
+		// The key with a SCALE length prefix, as a reader might wrongly build it, finds nothing.
+		let prefixed = kv_storage_key(para.id, &KEY.to_vec().encode());
+		let at = jam.jam_rpc.best_block_hash().await?;
+		let stored = jam.jam_rpc.service_value(&at, PARACHAIN_SERVICE_ID, &prefixed).await?;
+		anyhow::ensure!(stored.is_none(), "the length-prefixed key found {stored:?}");
+
+		submit_jam_kv(&jam, &para, "remove_kv", vec![Value::from_bytes(KEY)]).await?;
+		wait_for_value(&jam, &key, None).await
+	}
+	.await;
+
+	jam.destroy().await;
+	result
+}
+
+/// Submit `JamKv::<call>(fields)` as sudo through the para's first collator.
+async fn submit_jam_kv(
+	jam: &JamNetwork,
+	para: &Para,
+	call: &str,
+	fields: Vec<Value>,
+) -> anyhow::Result<()> {
+	let name = para.collators.first().context("the para has no collator")?;
+	let client = jam.collator_client(name).await?;
+	let block = submit_extrinsic_and_wait_for_best_block_success(
+		&client,
+		&sudo_call(dynamic("JamKv", call, fields)),
+		&dev::alice(),
+	)
+	.await?;
+	log::info!("JamKv::{call} included in para block {block:?}");
+	Ok(())
+}
+
+/// Poll `serviceValue` at JAM's best block until the service stores `expected` under `key`.
+async fn wait_for_value(
+	jam: &JamNetwork,
+	key: &[u8],
+	expected: Option<&[u8]>,
+) -> anyhow::Result<()> {
+	let started = Instant::now();
+	loop {
+		let at = jam.jam_rpc.best_block_hash().await?;
+		let stored = jam.jam_rpc.service_value(&at, PARACHAIN_SERVICE_ID, key).await?;
+		if stored.as_deref() == expected {
+			log::info!(
+				"serviceValue({PARACHAIN_SERVICE_ID}, 0x{}) is {:?} after {:?}",
+				hex::encode(key),
+				expected.map(String::from_utf8_lossy),
+				started.elapsed(),
+			);
+			return Ok(());
+		}
+		anyhow::ensure!(
+			started.elapsed() < KV_BUDGET,
+			"serviceValue({PARACHAIN_SERVICE_ID}, 0x{}) is {stored:?} after {KV_BUDGET:?}, \
+			 expected {expected:?}",
+			hex::encode(key),
+		);
+		tokio::time::sleep(Duration::from_secs(6)).await;
+	}
+}

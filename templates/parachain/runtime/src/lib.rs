@@ -339,6 +339,11 @@ mod runtime {
 	// Template
 	#[runtime::pallet_index(50)]
 	pub type TemplatePallet = pallet_parachain_template;
+
+	// JAM
+	#[cfg(jam)]
+	#[runtime::pallet_index(60)]
+	pub type JamKv = pallet_jam_kv;
 }
 
 #[docify::export(register_validate_block)]
