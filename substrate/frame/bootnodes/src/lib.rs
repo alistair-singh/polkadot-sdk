@@ -41,8 +41,11 @@
 //! The set can be seeded at genesis with entries signed ahead of time: `bootnodes-cli sign
 //! --offline` prints, as `bootnode`, an entry in the JSON form the genesis config takes.
 //!
-//! Publishing the set to the para-owned key-value store is not implemented yet. Readers consume
-//! the pallet's storage directly.
+//! After every change the pallet hands the SCALE-encoded set to [`Config::Publisher`], or `None`
+//! once the set is empty. On JAM the publisher writes it to the para's key-value store under
+//! [`BOOTNODES_KEY`], where nodes of other paras read it. A failed publish fails the change.
+//! Entries seeded at genesis are not published: there is no block to carry the message. They
+//! reach readers with the first change after genesis.
 //!
 //! ## Interface
 //!
@@ -81,6 +84,22 @@ pub use weights::WeightInfo;
 
 /// Domain separator prefixed to the bytes a node signs to prove possession of its key.
 pub const POP_DOMAIN: &[u8] = b"bootnode-pop-v1";
+
+/// The key the bootnode set is published under in the para's key-value store.
+pub const BOOTNODES_KEY: &[u8] = b"bootnodes/v1";
+
+/// Publishes the bootnode set after every change, e.g. to the para's key-value store on JAM.
+pub trait PublishBootnodes {
+	/// Publish `set`, the SCALE-encoded bootnode set, or withdraw it with `None` once the set is
+	/// empty. An error fails the change, and the set stays as it was.
+	fn publish(set: Option<&[u8]>) -> DispatchResult;
+}
+
+impl PublishBootnodes for () {
+	fn publish(_: Option<&[u8]>) -> DispatchResult {
+		Ok(())
+	}
+}
 
 /// A bootnode entry, as stored on chain and as submitted to [`Pallet::add_bootnode`].
 ///
@@ -234,6 +253,9 @@ pub mod pallet {
 		#[pallet::constant]
 		type MaxAddrLen: Get<u32>;
 
+		/// Receives the set after every change.
+		type Publisher: PublishBootnodes;
+
 		/// Weight information for the extrinsics of this pallet.
 		type WeightInfo: WeightInfo;
 
@@ -250,7 +272,8 @@ pub mod pallet {
 	#[pallet::genesis_config]
 	#[derive(DefaultNoBound)]
 	pub struct GenesisConfig<T: Config> {
-		/// Bootnodes listed from genesis. Each must carry a valid proof of possession.
+		/// Bootnodes listed from genesis. Each must carry a valid proof of possession. They are
+		/// stored but not published.
 		pub bootnodes: Vec<BootnodeOf<T>>,
 	}
 
@@ -258,7 +281,7 @@ pub mod pallet {
 	impl<T: Config> BuildGenesisConfig for GenesisConfig<T> {
 		fn build(&self) {
 			for bootnode in &self.bootnodes {
-				Pallet::<T>::do_add_bootnode(bootnode.clone())
+				Pallet::<T>::add(bootnode.clone(), false)
 					.expect("invalid bootnode in genesis config");
 			}
 		}
@@ -343,8 +366,14 @@ impl<T: Config> Pallet<T> {
 		sp_io::crypto::ed25519_verify(&bootnode.sig, &payload, &bootnode.node_key)
 	}
 
-	/// Validate `bootnode` and insert it, replacing an existing entry for the same node key.
+	/// Validate `bootnode` and insert it, replacing an existing entry for the same node key, then
+	/// publish the set.
 	pub fn do_add_bootnode(bootnode: BootnodeOf<T>) -> DispatchResult {
+		Self::add(bootnode, true)
+	}
+
+	/// Validate `bootnode` and insert it; publish the new set first if `publish`.
+	fn add(bootnode: BootnodeOf<T>, publish: bool) -> DispatchResult {
 		multiaddr::validate(&bootnode.addr).map_err(|e| match e {
 			multiaddr::Error::ContainsPeerId => Error::<T>::MultiaddrContainsPeerId,
 			_ => Error::<T>::InvalidMultiaddr,
@@ -361,6 +390,9 @@ impl<T: Config> Pallet<T> {
 			Some(index) => bootnodes[index] = bootnode,
 			None => bootnodes.force_push(bootnode),
 		}
+		if publish {
+			Self::publish(&bootnodes)?;
+		}
 		Bootnodes::<T>::put(bootnodes);
 
 		Self::deposit_event(match position {
@@ -370,7 +402,7 @@ impl<T: Config> Pallet<T> {
 		Ok(())
 	}
 
-	/// Remove the entry for `node_key` from the set.
+	/// Remove the entry for `node_key` from the set, then publish the set.
 	pub fn do_remove_bootnode(node_key: &ed25519::Public) -> DispatchResult {
 		Bootnodes::<T>::try_mutate(|bootnodes| -> DispatchResult {
 			let pos = bootnodes
@@ -378,10 +410,16 @@ impl<T: Config> Pallet<T> {
 				.position(|b| &b.node_key == node_key)
 				.ok_or(Error::<T>::UnknownBootnode)?;
 			bootnodes.remove(pos);
-			Ok(())
+			Self::publish(bootnodes)
 		})?;
 		Self::deposit_event(Event::BootnodeRemoved { node_key: *node_key });
 		Ok(())
+	}
+
+	/// Hand the encoded set to the publisher, or `None` if it is empty.
+	fn publish(bootnodes: &BoundedVec<BootnodeOf<T>, T::MaxBootnodes>) -> DispatchResult {
+		let encoded = (!bootnodes.is_empty()).then(|| bootnodes.encode());
+		T::Publisher::publish(encoded.as_deref())
 	}
 
 	/// Check the pallet's storage invariants.

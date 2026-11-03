@@ -18,11 +18,12 @@
 //! Test runtime for `pallet_bootnodes`.
 
 use crate as pallet_bootnodes;
+use core::cell::{Cell, RefCell};
 use frame_support::{derive_impl, parameter_types, traits::ConstU32};
 use frame_system::EnsureRoot;
 use sp_core::H256;
 use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
-use sp_runtime::BuildStorage;
+use sp_runtime::{BuildStorage, DispatchError, DispatchResult};
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
@@ -52,9 +53,41 @@ impl pallet_bootnodes::Config for Test {
 	type JamGenesisHash = JamGenesisHash;
 	type MaxBootnodes = ConstU32<MAX_BOOTNODES>;
 	type MaxAddrLen = ConstU32<MAX_ADDR_LEN>;
+	type Publisher = RecordingPublisher;
 	type WeightInfo = ();
 	#[cfg(feature = "runtime-benchmarks")]
 	type BenchmarkHelper = ();
+}
+
+thread_local! {
+	static PUBLISHED: RefCell<Vec<Option<Vec<u8>>>> = const { RefCell::new(Vec::new()) };
+	static PUBLISH_FAILS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The error [`RecordingPublisher`] returns while [`fail_publishing`] is set.
+pub const PUBLISH_FAILED: DispatchError = DispatchError::Other("publish failed");
+
+/// Records every published set, or fails while [`fail_publishing`] is set.
+pub struct RecordingPublisher;
+
+impl pallet_bootnodes::PublishBootnodes for RecordingPublisher {
+	fn publish(set: Option<&[u8]>) -> DispatchResult {
+		if PUBLISH_FAILS.get() {
+			return Err(PUBLISH_FAILED);
+		}
+		PUBLISHED.with_borrow_mut(|published| published.push(set.map(<[u8]>::to_vec)));
+		Ok(())
+	}
+}
+
+/// The sets published since the last call, oldest first.
+pub fn take_published() -> Vec<Option<Vec<u8>>> {
+	PUBLISHED.take()
+}
+
+/// Make [`RecordingPublisher`] fail, or succeed again.
+pub fn fail_publishing(fail: bool) {
+	PUBLISH_FAILS.set(fail);
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {

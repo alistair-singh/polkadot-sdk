@@ -78,6 +78,8 @@ fn genesis_config_lists_bootnodes() {
 	sp_io::TestExternalities::new(storage).execute_with(|| {
 		assert_eq!(BootnodeSet::<Test>::get().to_vec(), bootnodes);
 		assert_ok!(Bootnodes::do_try_state());
+		// Genesis has no block to carry the message, so nothing is published.
+		assert_eq!(take_published(), vec![]);
 	});
 }
 
@@ -371,5 +373,109 @@ fn try_state_detects_broken_invariants() {
 			set[0].addr = vec![4, 1, 2, 3].try_into().unwrap();
 		});
 		assert!(Bootnodes::do_try_state().is_err());
+	});
+}
+
+#[test]
+fn every_change_publishes_the_encoded_set() {
+	new_test_ext().execute_with(|| {
+		let (a, b) = (pair(1), pair(2));
+		let encoded_set = || Some(BootnodeSet::<Test>::get().encode());
+
+		assert_ok!(Bootnodes::add_bootnode(
+			RuntimeOrigin::root(),
+			signed(&a, EXPIRY, "/ip4/1.2.3.4/tcp/1")
+		));
+		assert_eq!(take_published(), vec![encoded_set()]);
+
+		assert_ok!(Bootnodes::add_bootnode(
+			RuntimeOrigin::root(),
+			signed(&b, EXPIRY, "/ip4/1.2.3.4/tcp/2")
+		));
+		assert_eq!(take_published(), vec![encoded_set()]);
+
+		// Replacing an entry publishes too.
+		assert_ok!(Bootnodes::add_bootnode(
+			RuntimeOrigin::root(),
+			signed(&b, EXPIRY, "/ip4/1.2.3.4/tcp/3")
+		));
+		assert_eq!(take_published(), vec![encoded_set()]);
+
+		assert_ok!(Bootnodes::remove_bootnode(RuntimeOrigin::root(), a.public()));
+		assert_eq!(take_published(), vec![encoded_set()]);
+
+		// Removing the last entry withdraws the set.
+		assert_ok!(Bootnodes::remove_bootnode(RuntimeOrigin::root(), b.public()));
+		assert_eq!(take_published(), vec![None]);
+	});
+}
+
+#[test]
+fn rejected_changes_publish_nothing() {
+	new_test_ext().execute_with(|| {
+		for i in 0..MAX_BOOTNODES as u8 {
+			assert_ok!(Bootnodes::add_bootnode(
+				RuntimeOrigin::root(),
+				signed(&pair(i + 1), EXPIRY, &format!("/ip4/1.2.3.4/tcp/{}", 30_000 + i as u16))
+			));
+		}
+		take_published();
+
+		let extra = signed(&pair(200), EXPIRY, "/ip4/1.2.3.4/tcp/40000");
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::signed(1), extra.clone()),
+			DispatchError::BadOrigin
+		);
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), extra),
+			Error::<Test>::TooManyBootnodes
+		);
+		assert_noop!(
+			Bootnodes::remove_bootnode(RuntimeOrigin::signed(1), pair(1).public()),
+			DispatchError::BadOrigin
+		);
+		assert_noop!(
+			Bootnodes::remove_bootnode(RuntimeOrigin::root(), pair(200).public()),
+			Error::<Test>::UnknownBootnode
+		);
+		assert_eq!(take_published(), vec![]);
+	});
+}
+
+#[test]
+fn failed_publish_leaves_the_set_unchanged() {
+	new_test_ext().execute_with(|| {
+		let a = pair(1);
+		assert_ok!(Bootnodes::add_bootnode(
+			RuntimeOrigin::root(),
+			signed(&a, EXPIRY, "/ip4/1.2.3.4/tcp/1")
+		));
+		take_published();
+
+		fail_publishing(true);
+		assert_noop!(
+			Bootnodes::add_bootnode(
+				RuntimeOrigin::root(),
+				signed(&a, EXPIRY, "/ip4/1.2.3.4/tcp/2")
+			),
+			PUBLISH_FAILED
+		);
+		assert_noop!(
+			Bootnodes::add_bootnode(
+				RuntimeOrigin::root(),
+				signed(&pair(2), EXPIRY, "/ip4/1.2.3.4/tcp/2")
+			),
+			PUBLISH_FAILED
+		);
+		assert_noop!(Bootnodes::remove_bootnode(RuntimeOrigin::root(), a.public()), PUBLISH_FAILED);
+		// The pallet's own entry points do not rely on the call's storage layer.
+		assert_noop!(Bootnodes::do_remove_bootnode(&a.public()), PUBLISH_FAILED);
+		fail_publishing(false);
+
+		assert_eq!(
+			BootnodeSet::<Test>::get().to_vec(),
+			vec![signed(&a, EXPIRY, "/ip4/1.2.3.4/tcp/1")]
+		);
+		assert_eq!(take_published(), vec![]);
 	});
 }
