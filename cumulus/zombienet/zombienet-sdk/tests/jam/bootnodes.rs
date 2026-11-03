@@ -22,8 +22,9 @@
 //! bootnodes with sudo, replaces one, removes both, and after each change waits for
 //! `serviceValue` on the Parachain Service to hold exactly the set the para now stores.
 //!
-//! `pallet-bootnodes` does not check entries yet. The entries are still properly signed, so the
-//! test keeps passing once it does.
+//! `pallet-bootnodes` does not check entries yet. The entries are signed under the runtime's
+//! placeholder JAM genesis hash, `H256::zero()`, so they stop verifying once the runtime uses the
+//! real hash; the test must then sign under that hash.
 
 use anyhow::Context;
 use codec::Encode;
@@ -44,8 +45,11 @@ use zombienet_sdk::{
 	subxt_signer::sr25519::dev,
 };
 
+/// The runtime's `MAX_BOOTNODE_ADDR_LEN`, checked against its metadata before the test starts.
+const MAX_ADDR_LEN: u32 = 128;
+
 /// A bootnode entry. The address bound only matters for decoding; the encoding is the runtime's.
-type Bootnode = pallet_bootnodes::Bootnode<frame_support::traits::ConstU32<128>>;
+type Bootnode = pallet_bootnodes::Bootnode<frame_support::traits::ConstU32<MAX_ADDR_LEN>>;
 
 const EXPIRY_SLOT: u32 = 1_000_000;
 
@@ -59,12 +63,11 @@ const KV_BUDGET: Duration = Duration::from_secs(4 * 60);
 #[tokio::test(flavor = "multi_thread")]
 async fn bootnodes_are_published_to_jam() -> Result<(), anyhow::Error> {
 	let para = Para::single(1);
-	let jam =
-		spawn("bootnodes_are_published_to_jam", &[Para::single(1)], SpawnOptions::new(TINY_CORES))
-			.await?;
+	let paras = std::slice::from_ref(&para);
+	let jam = spawn("bootnodes_are_published_to_jam", paras, SpawnOptions::new(TINY_CORES)).await?;
 	let result = async {
-		wait_for_collators(&jam.network, &[Para::single(1)], BLOCKS, FINALIZED, DEADLINE.as_secs())
-			.await?;
+		wait_for_collators(&jam.network, paras, BLOCKS, FINALIZED, DEADLINE.as_secs()).await?;
+		check_max_addr_len(&jam, &para).await?;
 		let key = kv_storage_key(para.id, BOOTNODES_KEY);
 		let (alpha, beta) = (node_key(1), node_key(2));
 
@@ -124,6 +127,22 @@ async fn remove_bootnode(
 	node_key: &ed25519::Public,
 ) -> anyhow::Result<()> {
 	submit_bootnodes(jam, para, "remove_bootnode", vec![Value::from_bytes(node_key)]).await
+}
+
+/// Fail if the runtime's address bound is not the one [`Bootnode`] uses.
+async fn check_max_addr_len(jam: &JamNetwork, para: &Para) -> anyhow::Result<()> {
+	let name = para.collators.first().context("the para has no collator")?;
+	let client = jam.collator_client(name).await?;
+	let max_addr_len = client
+		.constants()
+		.at(&zombienet_sdk::subxt::dynamic::constant("Bootnodes", "MaxAddrLen"))?
+		.to_value()?
+		.as_u128();
+	anyhow::ensure!(
+		max_addr_len == Some(MAX_ADDR_LEN.into()),
+		"the runtime's Bootnodes::MaxAddrLen is {max_addr_len:?}, the test uses {MAX_ADDR_LEN}",
+	);
+	Ok(())
 }
 
 /// Submit `Bootnodes::<call>(fields)` as sudo through the para's first collator.
