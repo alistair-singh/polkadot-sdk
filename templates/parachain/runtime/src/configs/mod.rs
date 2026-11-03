@@ -383,6 +383,77 @@ impl pallet_jam_kv::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type SelfParaId = SelfParaIdU32;
 	type MaxKeyLen = ConstU32<128>;
-	type MaxValueLen = ConstU32<4096>;
+	type MaxValueLen = ConstU32<JAM_KV_MAX_VALUE_LEN>;
 	type MaxBytesPerBlock = ConstU32<{ 16 * 1024 }>;
+}
+
+/// The largest value the para writes to its key/value storage.
+#[cfg(jam)]
+const JAM_KV_MAX_VALUE_LEN: u32 = 4096;
+
+/// The SpecMsg address record lists at most 4 bootnodes.
+#[cfg(jam)]
+const MAX_BOOTNODES: u32 = 4;
+
+/// The longest binary multiaddr a listed bootnode may have.
+#[cfg(jam)]
+const MAX_BOOTNODE_ADDR_LEN: u32 = 128;
+
+// The largest bootnode set fits one key/value entry. Per entry: a 2-byte compact length prefix
+// for the address (up to 16383 bytes), the address, the node key (32), the expiry slot (4) and
+// the signature (64). The set's own prefix is 1 byte below 64 entries.
+#[cfg(jam)]
+const _: () =
+	assert!(1 + MAX_BOOTNODES * (2 + MAX_BOOTNODE_ADDR_LEN + 32 + 4 + 64) <= JAM_KV_MAX_VALUE_LEN);
+
+/// Publishes the bootnode set to the para's key/value storage in the Parachain Service, under
+/// [`pallet_bootnodes::BOOTNODES_KEY`].
+#[cfg(jam)]
+pub struct BootnodesToJamKv;
+
+#[cfg(jam)]
+impl pallet_bootnodes::PublishBootnodes for BootnodesToJamKv {
+	fn publish(set: Option<&[u8]>) -> sp_runtime::DispatchResult {
+		use sp_runtime::DispatchError;
+		let key = pallet_bootnodes::BOOTNODES_KEY
+			.to_vec()
+			.try_into()
+			.map_err(|_| DispatchError::Other("the bootnodes key exceeds MaxKeyLen"))?;
+		match set {
+			Some(set) => {
+				let value = set
+					.to_vec()
+					.try_into()
+					.map_err(|_| DispatchError::Other("the bootnode set exceeds MaxValueLen"))?;
+				pallet_jam_kv::Pallet::<Runtime>::do_set_kv(key, value)
+			},
+			None => pallet_jam_kv::Pallet::<Runtime>::do_remove_kv(key),
+		}
+	}
+}
+
+/// Stands in for the JAM genesis hash, which the para's genesis cannot carry: JAM's genesis embeds
+/// the para's genesis head. Unused while `pallet-bootnodes` does not check proofs of possession.
+#[cfg(jam)]
+pub struct JamGenesisHashPlaceholder;
+
+#[cfg(jam)]
+impl frame_support::traits::Get<sp_core::H256> for JamGenesisHashPlaceholder {
+	fn get() -> sp_core::H256 {
+		sp_core::H256::zero()
+	}
+}
+
+/// Root lists the para's bootnodes; every change is published to JAM through `JamKv`.
+#[cfg(jam)]
+impl pallet_bootnodes::Config for Runtime {
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type ParaId = SelfParaIdU32;
+	type JamGenesisHash = JamGenesisHashPlaceholder;
+	type MaxBootnodes = ConstU32<MAX_BOOTNODES>;
+	type MaxAddrLen = ConstU32<MAX_BOOTNODE_ADDR_LEN>;
+	type Publisher = BootnodesToJamKv;
+	type WeightInfo = ();
+	#[cfg(feature = "runtime-benchmarks")]
+	type BenchmarkHelper = ();
 }
