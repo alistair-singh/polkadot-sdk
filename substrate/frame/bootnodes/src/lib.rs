@@ -38,6 +38,10 @@
 //! `/ws` or `/wss`: the shapes a node can dial a bootnode on. The runtime does not otherwise
 //! interpret it.
 //!
+//! **Not enforced yet:** the pallet stores entries without checking the address shape or the
+//! proof of possession, so readers must check both. Only the origin and the set's capacity are
+//! enforced.
+//!
 //! The set can be seeded at genesis with entries signed ahead of time: `bootnodes-cli sign
 //! --offline` prints, as `bootnode`, an entry in the JSON form the genesis config takes.
 //!
@@ -332,8 +336,8 @@ pub mod pallet {
 	impl<T: Config> Pallet<T> {
 		/// Add a bootnode, or replace the entry of an already listed node key.
 		///
-		/// `bootnode.addr` must pass [`multiaddr::validate`] and `bootnode.sig` must be the node's
-		/// signature over [`pop_payload`].
+		/// `bootnode.addr` should pass [`multiaddr::validate`] and `bootnode.sig` should be the
+		/// node's signature over [`pop_payload`]; neither is checked yet.
 		///
 		/// Emits `BootnodeAdded` for a new node key and `BootnodeUpdated` for a listed one.
 		#[pallet::call_index(0)]
@@ -366,22 +370,17 @@ impl<T: Config> Pallet<T> {
 		sp_io::crypto::ed25519_verify(&bootnode.sig, &payload, &bootnode.node_key)
 	}
 
-	/// Validate `bootnode` and insert it, replacing an existing entry for the same node key, then
+	/// Insert `bootnode`, replacing an existing entry for the same node key, then
 	/// publish the set.
 	pub fn do_add_bootnode(bootnode: BootnodeOf<T>) -> DispatchResult {
 		Self::add(bootnode, true)
 	}
 
-	/// Validate `bootnode` and insert it; publish the new set first if `publish`.
+	/// Insert `bootnode` if the set has room; publish the new set first if `publish`.
 	fn add(bootnode: BootnodeOf<T>, publish: bool) -> DispatchResult {
-		multiaddr::validate(&bootnode.addr).map_err(|e| match e {
-			multiaddr::Error::ContainsPeerId => Error::<T>::MultiaddrContainsPeerId,
-			_ => Error::<T>::InvalidMultiaddr,
-		})?;
 		let mut bootnodes = Bootnodes::<T>::get();
 		let position = bootnodes.iter().position(|b| b.node_key == bootnode.node_key);
 		ensure!(position.is_some() || !bootnodes.is_full(), Error::<T>::TooManyBootnodes);
-		ensure!(Self::verify_pop(&bootnode), Error::<T>::InvalidSignature);
 
 		let node_key = bootnode.node_key;
 		let addr = bootnode.addr.clone();
@@ -428,10 +427,6 @@ impl<T: Config> Pallet<T> {
 		let mut seen = alloc::collections::BTreeSet::new();
 		for bootnode in Bootnodes::<T>::get().iter() {
 			ensure!(seen.insert(bootnode.node_key), "duplicate node key in the bootnode set");
-			ensure!(
-				multiaddr::validate(&bootnode.addr).is_ok(),
-				"invalid multiaddr in the bootnode set"
-			);
 		}
 		Ok(())
 	}

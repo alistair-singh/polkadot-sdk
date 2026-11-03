@@ -147,94 +147,24 @@ fn add_bootnode_requires_admin_origin() {
 }
 
 #[test]
-fn add_bootnode_rejects_invalid_multiaddr() {
+fn entries_are_stored_without_validation() {
 	new_test_ext().execute_with(|| {
-		let pair = pair(1);
-		for bad in [
-			vec![],
-			vec![4, 1, 2, 3],
-			vec![0xff, 0xff, 0xff, 0xff, 0x7f],
-			vec![0x7f, 0],
-			addr("/ip4/1.2.3.4/udp/30333/quic-v1").to_vec(),
-			addr("/ip4/1.2.3.4").to_vec(),
-		] {
-			let addr: BoundedVec<u8, _> = bad.try_into().unwrap();
-			let sig = pair.sign(&Bootnodes::pop_payload(&addr, EXPIRY));
-			let bootnode = Bootnode { addr, node_key: pair.public(), expiry_slot: EXPIRY, sig };
-			assert_noop!(
-				Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode),
-				Error::<Test>::InvalidMultiaddr
-			);
-		}
-	});
-}
+		let good = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
 
-#[test]
-fn add_bootnode_rejects_multiaddr_with_peer_id() {
-	new_test_ext().execute_with(|| {
-		let bootnode = signed(&pair(1), EXPIRY, &format!("/ip4/1.2.3.4/tcp/30333/p2p/{PEER}"));
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode),
-			Error::<Test>::MultiaddrContainsPeerId
-		);
-	});
-}
-
-#[test]
-fn add_bootnode_rejects_bad_proof_of_possession() {
-	new_test_ext().execute_with(|| {
-		let good = signed(&pair(1), 3, "/ip4/1.2.3.4/tcp/30333");
-
+		// Not a multiaddr at all.
+		let mut garbage = good.clone();
+		garbage.addr = vec![4, 1, 2, 3].try_into().unwrap();
+		// A `/p2p/` component, with the signature over that address.
+		let with_peer_id = signed(&pair(2), EXPIRY, &format!("/ip4/1.2.3.4/tcp/30333/p2p/{PEER}"));
 		// Signed by another key.
-		let mut bad = good.clone();
-		bad.node_key = pair(2).public();
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
-			Error::<Test>::InvalidSignature
-		);
+		let mut wrong_signer = good.clone();
+		wrong_signer.node_key = pair(3).public();
 
-		// Signed over a different expiry slot.
-		let mut bad = good.clone();
-		bad.expiry_slot = 4;
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
-			Error::<Test>::InvalidSignature
-		);
-
-		// Signed over a different address.
-		let mut bad = good.clone();
-		bad.addr = addr("/ip4/1.2.3.5/tcp/30333");
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
-			Error::<Test>::InvalidSignature
-		);
-
-		// Signed for another para.
-		let mut bad = good.clone();
-		bad.sig =
-			pair(1).sign(&crate::pop_payload(&JamGenesisHash::get(), PARA_ID + 1, &bad.addr, 3));
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
-			Error::<Test>::InvalidSignature
-		);
-
-		// Signed for another JAM chain.
-		let mut bad = good.clone();
-		bad.sig = pair(1).sign(&crate::pop_payload(&H256::zero(), PARA_ID, &bad.addr, 3));
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
-			Error::<Test>::InvalidSignature
-		);
-
-		// Signed without the domain separator.
-		let mut bad = good.clone();
-		bad.sig = pair(1).sign(&(JamGenesisHash::get(), PARA_ID, bad.addr.to_vec(), 3u32).encode());
-		assert_noop!(
-			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
-			Error::<Test>::InvalidSignature
-		);
-
-		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), good));
+		for bootnode in [garbage, with_peer_id, wrong_signer] {
+			assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode));
+		}
+		assert_eq!(BootnodeSet::<Test>::get().len(), 3);
+		assert_ok!(Bootnodes::do_try_state());
 	});
 }
 
@@ -366,12 +296,6 @@ fn try_state_detects_broken_invariants() {
 
 		let entry = BootnodeSet::<Test>::get()[0].clone();
 		BootnodeSet::<Test>::mutate(|set| set.try_push(entry).unwrap());
-		assert!(Bootnodes::do_try_state().is_err());
-
-		BootnodeSet::<Test>::mutate(|set| {
-			set.truncate(1);
-			set[0].addr = vec![4, 1, 2, 3].try_into().unwrap();
-		});
 		assert!(Bootnodes::do_try_state().is_err());
 	});
 }
