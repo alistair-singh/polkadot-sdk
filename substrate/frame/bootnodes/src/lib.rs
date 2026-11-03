@@ -276,8 +276,9 @@ pub mod pallet {
 	#[pallet::genesis_config]
 	#[derive(DefaultNoBound)]
 	pub struct GenesisConfig<T: Config> {
-		/// Bootnodes listed from genesis. Each must carry a valid proof of possession. They are
-		/// stored but not published.
+		/// Bootnodes listed from genesis. As with `add_bootnode`, only the set's capacity is
+		/// checked: more than `MaxBootnodes` entries fail the build. They are stored but not
+		/// published.
 		pub bootnodes: Vec<BootnodeOf<T>>,
 	}
 
