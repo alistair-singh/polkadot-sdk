@@ -27,7 +27,8 @@
 //! refuses B's sync protocol; the connection itself is what shows B found A through JAM: B has
 //! no other way to learn `alpha`'s address, and the handshake checks the peer id. Root on A then
 //! writes a set past the pallet with `JamKv::set_kv`, and B dials only the entries the pallet
-//! would have accepted.
+//! would have accepted and whose lease holds: an entry that expired before it was written is
+//! never learned, and `beta`'s short lease expires on B without A writing again.
 //!
 //! `pallet-bootnodes` does not check the proof of possession yet. The entries are signed under the
 //! runtime's placeholder JAM genesis hash, `H256::zero()`, so they stop verifying once the runtime
@@ -61,7 +62,9 @@ const MAX_ADDR_LEN: u32 = 128;
 /// A bootnode entry. The address bound only matters for decoding; the encoding is the runtime's.
 type Bootnode = pallet_bootnodes::Bootnode<frame_support::traits::ConstU32<MAX_ADDR_LEN>>;
 
-const EXPIRY_SLOT: u32 = 1_000_000;
+/// A lease that never ends: JAM slots count from the JAM epoch, so they are already in the
+/// millions.
+const EXPIRY_SLOT: u32 = u32::MAX;
 
 /// The para must be producing blocks before a call can land in one.
 const BLOCKS: u64 = 5;
@@ -157,30 +160,46 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &alpha_peer])
 			.await?;
 
-		// Root writes the set past the pallet: an entry the pallet would reject, then `beta`.
-		let rejected_key = node_key(9);
+		// Root writes the set past the pallet: an entry the pallet would reject, one whose lease
+		// is already over, and `beta` with a lease of `BETA_LEASE` slots.
+		let (rejected_key, expired_key) = (node_key(9), node_key(8));
 		let rejected = signed(&rejected_key, a.id, "/ip4/127.0.0.1/udp/30333/quic-v1");
-		let beta_entry = signed(&beta, a.id, &format!("/ip4/127.0.0.1/tcp/{beta_port}/ws"));
+		let expired = signed_until(&expired_key, a.id, "/ip4/127.0.0.1/tcp/1/ws", 1);
+		let beta_expiry = u32::try_from(jam.jam_rpc.finalized_slot().await?)? + BETA_LEASE;
+		let beta_addr = format!("/ip4/127.0.0.1/tcp/{beta_port}/ws");
+		let beta_entry = signed_until(&beta, a.id, &beta_addr, beta_expiry);
 		// A `Vec`, not an array: SCALE gives arrays no length prefix.
-		let set = vec![&rejected, &beta_entry];
+		let set = vec![&rejected, &expired, &beta_entry];
 		set_kv(&jam, &a, BOOTNODES_KEY, &set.encode()).await?;
 		wait_for_set(&jam, &kv_storage_key(a.id, BOOTNODES_KEY), &set).await?;
-		// Both entries come from one update, so once `beta` is learned the other was skipped.
+		// All entries come from one update, so once `beta` is learned the others were skipped.
 		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
-		let rejected_peer = peer_id(&rejected_key);
+		let skipped = [(&rejected_key, "the pallet would reject"), (&expired_key, "had expired")];
+		for (key, why) in skipped {
+			let peer = peer_id(key);
+			let learned = log_lines_with(&jam, "gamma", &["Learned a bootnode", &peer]).await?;
+			anyhow::ensure!(learned.is_empty(), "gamma learned the entry that {why}");
+		}
+		wait_for_connection(&jam, "gamma", &beta_peer).await?;
+
+		// The value does not change again; `beta` drops off once JAM passes its expiry slot.
+		wait_for_log(&jam, "gamma", &["A bootnode of para 0 expired.", &beta_peer]).await?;
+		let at = jam.jam_rpc.finalized_slot().await?;
 		anyhow::ensure!(
-			log_lines_with(&jam, "gamma", &["Learned a bootnode", &rejected_peer])
-				.await?
-				.is_empty(),
-			"gamma learned the entry the pallet would reject",
+			at + 1 >= u64::from(beta_expiry),
+			"gamma dropped beta at finalized slot {at}, before its expiry slot {beta_expiry}",
 		);
-		wait_for_connection(&jam, "gamma", &beta_peer).await
+		Ok(())
 	}
 	.await;
 
 	jam.destroy().await;
 	result
 }
+
+/// `beta`'s lease in the `set_kv` phase, in JAM slots (6 s each): long enough for the set to reach
+/// JAM and `gamma` to dial it, short enough to expire within [`KV_BUDGET`].
+const BETA_LEASE: u32 = 15;
 
 /// How long a node may take to dial a peer it just learned: its peerset fills free slots every
 /// second or so.
@@ -246,13 +265,18 @@ fn node_key(seed: u8) -> ed25519::Pair {
 }
 
 /// An entry for `pair` at `addr`, signed for `para_id` under the runtime's placeholder JAM
-/// genesis hash.
+/// genesis hash, with a lease past the test's end.
 fn signed(pair: &ed25519::Pair, para_id: u32, addr: &str) -> Bootnode {
+	signed_until(pair, para_id, addr, EXPIRY_SLOT)
+}
+
+/// As [`signed`], with the lease ending at `expiry_slot`.
+fn signed_until(pair: &ed25519::Pair, para_id: u32, addr: &str, expiry_slot: u32) -> Bootnode {
 	let addr: multiaddr::Multiaddr = addr.parse().expect("the test's addresses parse; qed");
 	let addr: frame_support::BoundedVec<u8, _> =
 		addr.to_vec().try_into().expect("the test's addresses are short; qed");
-	let sig = pair.sign(&pallet_bootnodes::pop_payload(&H256::zero(), para_id, &addr, EXPIRY_SLOT));
-	Bootnode { addr, node_key: pair.public(), expiry_slot: EXPIRY_SLOT, sig }
+	let sig = pair.sign(&pallet_bootnodes::pop_payload(&H256::zero(), para_id, &addr, expiry_slot));
+	Bootnode { addr, node_key: pair.public(), expiry_slot, sig }
 }
 
 async fn add_bootnode(jam: &JamNetwork, para: &Para, entry: &Bootnode) -> anyhow::Result<()> {

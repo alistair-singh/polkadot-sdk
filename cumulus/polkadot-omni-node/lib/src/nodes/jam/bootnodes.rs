@@ -23,12 +23,15 @@
 //!
 //! The reader checks each entry's address the way `pallet-bootnodes` does
 //! ([`pallet_bootnodes::multiaddr::validate`]), since root on the other para can write the value
-//! without the pallet. The proof of possession and `expiry_slot` are not checked yet.
+//! without the pallet. It drops an entry once JAM's slot is past its `expiry_slot`, the consent
+//! lease the operator signed: the set is checked again on every JAM block, not only when it
+//! changes, so an entry expires even if the other para never writes again. The proof of
+//! possession is not checked yet.
 
 use super::LOG_TARGET;
 use codec::Decode;
 use futures::StreamExt;
-use jam_interface::{JamStateSource, ServiceId};
+use jam_interface::{JamChainSource, JamStateSource, ServiceId, Slot};
 use pallet_bootnodes::BOOTNODES_KEY;
 use sc_network::{multiaddr::Protocol, Multiaddr, PeerId};
 use std::sync::Arc;
@@ -40,11 +43,26 @@ type Bootnode = pallet_bootnodes::Bootnode<sp_core::ConstU32<4096>>;
 /// A listed node, as the network dials it.
 pub(crate) type KnownBootnode = (PeerId, Multiaddr);
 
-/// The dialable nodes of a published set; `None` is the empty set.
-pub(crate) fn dialable(value: Option<&[u8]>) -> Result<Vec<KnownBootnode>, codec::Error> {
+/// A dialable node and the last JAM slot its operator consented to being listed in.
+pub(crate) type Leased = (KnownBootnode, u32);
+
+/// The dialable nodes of a published set, with their leases; `None` is the empty set.
+pub(crate) fn dialable(value: Option<&[u8]>) -> Result<Vec<Leased>, codec::Error> {
 	let Some(mut value) = value else { return Ok(Vec::new()) };
 	let set = Vec::<Bootnode>::decode(&mut value)?;
-	Ok(set.iter().filter_map(known_bootnode).collect())
+	Ok(set
+		.iter()
+		.filter_map(|bootnode| Some((known_bootnode(bootnode)?, bootnode.expiry_slot)))
+		.collect())
+}
+
+/// The nodes whose lease still holds at `now`: an entry counts up to and including its
+/// `expiry_slot`, the slot "after which readers drop the entry".
+pub(crate) fn unexpired(set: &[Leased], now: Slot) -> Vec<KnownBootnode> {
+	set.iter()
+		.filter(|(_, expiry_slot)| now <= *expiry_slot)
+		.map(|(node, _)| node.clone())
+		.collect()
 }
 
 /// `addr/p2p/<peer id of node_key>`, or `None` for an entry the pallet would not have accepted
@@ -90,42 +108,72 @@ impl Listed {
 	}
 }
 
+/// What the reader follows: the other para's value, and JAM's clock.
+enum Event {
+	Value(jam_interface::ChainSubUpdate<Option<Vec<u8>>>),
+	Block(jam_interface::BlockDesc),
+}
+
 /// Follow `para_id`'s published set at JAM's best block and pass every newly listed node to
-/// `add_known_address`. Returns when the subscription ends.
+/// `add_known_address`. Returns when either subscription ends.
 ///
-/// A node that drops off the set is only logged: the network has no way to forget an address.
-pub(crate) async fn follow<Jam: JamStateSource + ?Sized>(
+/// A node that drops off the set, or whose lease expires, is only logged: the network has no
+/// way to forget an address.
+pub(crate) async fn follow<Jam: JamStateSource + JamChainSource + ?Sized>(
 	jam: Arc<Jam>,
 	parachain_service: ServiceId,
 	para_id: u32,
 	add_known_address: impl Fn(PeerId, Multiaddr),
 ) {
 	let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
-	let mut updates = match jam.service_value_stream(parachain_service, &key, false).await {
-		Ok(updates) => updates,
+	let streams = futures::try_join!(
+		jam.service_value_stream(parachain_service, &key, false),
+		jam.best_block_stream(),
+	);
+	let (values, blocks) = match streams {
+		Ok(streams) => streams,
 		Err(error) => {
 			tracing::error!(target: LOG_TARGET, para_id, ?error, "Unable to follow the para's bootnodes on JAM.");
 			return;
 		},
 	};
 	tracing::info!(target: LOG_TARGET, para_id, "Following the para's bootnodes on JAM.");
+	let (mut values, mut blocks) = (values.fuse(), blocks.fuse());
 
-	let mut listed = Listed::default();
-	while let Some(update) = updates.next().await {
-		let now = match dialable(update.value.as_deref()) {
-			Ok(now) => now,
-			Err(error) => {
-				tracing::warn!(target: LOG_TARGET, para_id, at = ?update.header_hash, ?error, "The para's bootnode set does not decode; keeping the nodes listed before.");
-				continue;
-			},
+	let (mut set, mut now, mut listed) = (Vec::new(), 0, Listed::default());
+	loop {
+		// Either stream ending ends the reader: without values there is nothing to follow, and
+		// without blocks no lease could expire.
+		let event = futures::select! {
+			update = values.next() => update.map(Event::Value),
+			block = blocks.next() => block.map(Event::Block),
 		};
-		let Change { added, removed } = listed.update(now);
+		let Some(event) = event else { break };
+		match event {
+			Event::Value(update) => {
+				now = now.max(update.slot);
+				match dialable(update.value.as_deref()) {
+					Ok(dialable) => set = dialable,
+					Err(error) => {
+						tracing::warn!(target: LOG_TARGET, para_id, at = ?update.header_hash, ?error, "The para's bootnode set does not decode; keeping the nodes listed before.");
+						continue;
+					},
+				}
+			},
+			Event::Block(block) => now = now.max(block.slot),
+		}
+		let Change { added, removed } = listed.update(unexpired(&set, now));
 		for (peer_id, addr) in added {
-			tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = update.slot, "Learned a bootnode of para {para_id}.");
+			tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "Learned a bootnode of para {para_id}.");
 			add_known_address(peer_id, addr);
 		}
-		for (peer_id, addr) in removed {
-			tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = update.slot, "A bootnode of para {para_id} is no longer listed.");
+		for node in removed {
+			let (peer_id, addr) = &node;
+			if set.iter().any(|(listed, _)| *listed == node) {
+				tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} expired.");
+			} else {
+				tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} is no longer listed.");
+			}
 		}
 	}
 	tracing::warn!(target: LOG_TARGET, para_id, "The subscription to the para's bootnodes ended.");
@@ -153,6 +201,11 @@ mod tests {
 		PeerId::from_ed25519(&public.0).expect("an ed25519 key is a peer id; qed")
 	}
 
+	/// The dialable nodes of `value`, leases aside.
+	fn nodes(value: Option<&[u8]>) -> Result<Vec<KnownBootnode>, codec::Error> {
+		dialable(value).map(|set| set.into_iter().map(|(node, _)| node).collect())
+	}
+
 	fn known(seed: u8, addr: &str) -> KnownBootnode {
 		let addr: Multiaddr = format!("{addr}/p2p/{}", peer(seed)).parse().expect("valid; qed");
 		(peer(seed), addr)
@@ -163,19 +216,19 @@ mod tests {
 		let set = vec![entry(1, "/ip4/127.0.0.1/tcp/30333"), entry(2, "/dns/b.example/tcp/1/ws")];
 
 		assert_eq!(
-			dialable(Some(&set.encode())),
+			nodes(Some(&set.encode())),
 			Ok(vec![known(1, "/ip4/127.0.0.1/tcp/30333"), known(2, "/dns/b.example/tcp/1/ws")]),
 		);
 	}
 
 	#[test]
 	fn no_value_is_the_empty_set() {
-		assert_eq!(dialable(None), Ok(vec![]));
+		assert_eq!(nodes(None), Ok(vec![]));
 	}
 
 	#[test]
 	fn a_value_that_is_no_set_is_an_error() {
-		assert!(dialable(Some(&[0x04, 0xff])).is_err());
+		assert!(nodes(Some(&[0x04, 0xff])).is_err());
 	}
 
 	/// Root on the other para can write any set, so the reader skips every address the pallet
@@ -197,7 +250,33 @@ mod tests {
 		let fine = entry(6, "/ip4/127.0.0.1/tcp/6");
 		let set = vec![garbage, with_peer_id, udp, memory, non_canonical, fine];
 
-		assert_eq!(dialable(Some(&set.encode())), Ok(vec![known(6, "/ip4/127.0.0.1/tcp/6")]));
+		assert_eq!(nodes(Some(&set.encode())), Ok(vec![known(6, "/ip4/127.0.0.1/tcp/6")]));
+	}
+
+	#[test]
+	fn every_entry_keeps_its_lease() {
+		let (mut a, mut b) = (entry(1, "/ip4/127.0.0.1/tcp/1"), entry(2, "/ip4/127.0.0.1/tcp/2"));
+		(a.expiry_slot, b.expiry_slot) = (7, u32::MAX);
+
+		assert_eq!(
+			dialable(Some(&vec![a, b].encode())),
+			Ok(vec![
+				(known(1, "/ip4/127.0.0.1/tcp/1"), 7),
+				(known(2, "/ip4/127.0.0.1/tcp/2"), u32::MAX)
+			]),
+		);
+	}
+
+	/// An entry counts up to and including its `expiry_slot`; `u32::MAX` never expires.
+	#[test]
+	fn a_lease_holds_through_its_expiry_slot() {
+		let (a, forever) = (known(1, "/ip4/127.0.0.1/tcp/1"), known(2, "/ip4/127.0.0.1/tcp/2"));
+		let set = vec![(a.clone(), 7), (forever.clone(), u32::MAX)];
+
+		assert_eq!(unexpired(&set, 0), vec![a.clone(), forever.clone()]);
+		assert_eq!(unexpired(&set, 7), vec![a, forever.clone()]);
+		assert_eq!(unexpired(&set, 8), vec![forever.clone()]);
+		assert_eq!(unexpired(&set, u32::MAX), vec![forever]);
 	}
 
 	/// The reader hands each node to the network once, and names the ones that left the set.
