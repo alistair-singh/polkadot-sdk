@@ -35,10 +35,10 @@ fn addr(addr: &str) -> BoundedVec<u8, <Test as crate::Config>::MaxAddrLen> {
 	addr.parse::<Multiaddr>().unwrap().to_vec().try_into().unwrap()
 }
 
-/// A bootnode entry for `pair` with a valid proof of possession.
+/// A bootnode entry for `pair` with a valid proof of possession under [`JAM_GENESIS_HASH`].
 fn signed(pair: &ed25519::Pair, expiry_slot: u32, address: &str) -> BootnodeOf<Test> {
 	let addr = addr(address);
-	let sig = pair.sign(&Bootnodes::pop_payload(&addr, expiry_slot));
+	let sig = pair.sign(&crate::pop_payload(&JAM_GENESIS_HASH, PARA_ID, &addr, expiry_slot));
 	Bootnode { addr, node_key: pair.public(), expiry_slot, sig }
 }
 
@@ -59,8 +59,8 @@ fn pop_payload_has_the_documented_layout() {
 	expected.extend_from_slice(&7u32.to_le_bytes());
 	assert_eq!(payload, expected);
 
-	// The pallet binds its own constants.
-	assert_eq!(Bootnodes::pop_payload(&address, 7), payload);
+	// The pallet binds its own para id and stored JAM genesis hash.
+	new_test_ext().execute_with(|| assert_eq!(Bootnodes::pop_payload(&address, 7), Some(payload)));
 }
 
 /// Readers on other paras decode the value under `bootnodes/v1` with their own copy of the type,
@@ -102,7 +102,10 @@ fn genesis_config_lists_bootnodes() {
 		signed(&pair(2), EXPIRY, "/dns/boot.example.org/tcp/2/ws"),
 	];
 	let storage = RuntimeGenesisConfig {
-		bootnodes: crate::GenesisConfig { bootnodes: bootnodes.clone() },
+		bootnodes: crate::GenesisConfig {
+			jam_genesis_hash: Some(JAM_GENESIS_HASH),
+			bootnodes: bootnodes.clone(),
+		},
 		..Default::default()
 	}
 	.build_storage()
@@ -196,7 +199,7 @@ fn add_bootnode_rejects_invalid_multiaddr() {
 			addr("/ip4/1.2.3.4").to_vec(),
 		] {
 			let addr: BoundedVec<u8, _> = bad.try_into().unwrap();
-			let sig = pair.sign(&Bootnodes::pop_payload(&addr, EXPIRY));
+			let sig = pair.sign(&Bootnodes::pop_payload(&addr, EXPIRY).unwrap());
 			let bootnode = Bootnode { addr, node_key: pair.public(), expiry_slot: EXPIRY, sig };
 			assert_noop!(
 				Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode),
@@ -222,7 +225,10 @@ fn add_bootnode_rejects_multiaddr_with_peer_id() {
 fn genesis_config_rejects_invalid_multiaddr() {
 	let bootnode = signed(&pair(1), EXPIRY, &format!("/ip4/1.2.3.4/tcp/30333/p2p/{PEER}"));
 	let _ = RuntimeGenesisConfig {
-		bootnodes: crate::GenesisConfig { bootnodes: vec![bootnode] },
+		bootnodes: crate::GenesisConfig {
+			jam_genesis_hash: Some(JAM_GENESIS_HASH),
+			bootnodes: vec![bootnode],
+		},
 		..Default::default()
 	}
 	.build_storage();
@@ -238,6 +244,70 @@ fn an_already_expired_entry_is_accepted() {
 		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), expired.clone()));
 		assert_eq!(BootnodeSet::<Test>::get().to_vec(), vec![expired]);
 	});
+}
+
+/// Externalities as a para JAM's genesis embeds starts with: no JAM genesis hash.
+fn without_jam_genesis_hash() -> sp_io::TestExternalities {
+	let storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+	let mut ext = sp_io::TestExternalities::new(storage);
+	ext.execute_with(|| System::set_block_number(1));
+	ext
+}
+
+#[test]
+fn no_bootnode_is_listed_before_the_jam_genesis_hash_is_set() {
+	without_jam_genesis_hash().execute_with(|| {
+		let bootnode = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
+		assert_eq!(Bootnodes::pop_payload(&bootnode.addr, EXPIRY), None);
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode.clone()),
+			Error::<Test>::JamGenesisHashUnset
+		);
+
+		assert_ok!(Bootnodes::set_jam_genesis_hash(RuntimeOrigin::root(), JAM_GENESIS_HASH));
+		System::assert_last_event(Event::JamGenesisHashSet { hash: JAM_GENESIS_HASH }.into());
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode));
+	});
+}
+
+#[test]
+fn set_jam_genesis_hash_requires_admin_origin() {
+	without_jam_genesis_hash().execute_with(|| {
+		assert_noop!(
+			Bootnodes::set_jam_genesis_hash(RuntimeOrigin::signed(1), JAM_GENESIS_HASH),
+			DispatchError::BadOrigin
+		);
+		assert_eq!(crate::JamGenesisHash::<Test>::get(), None);
+	});
+}
+
+/// Not set-once for now (open question 5 in BootnodeKVJAM.md): a change keeps the listed entries,
+/// whose proofs of possession bind the old hash.
+#[test]
+fn the_jam_genesis_hash_can_change_and_listed_entries_stay() {
+	new_test_ext().execute_with(|| {
+		let bootnode = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode.clone()));
+		let other = H256::repeat_byte(0x4b);
+
+		assert_ok!(Bootnodes::set_jam_genesis_hash(RuntimeOrigin::root(), other));
+		assert_eq!(crate::JamGenesisHash::<Test>::get(), Some(other));
+		assert_eq!(BootnodeSet::<Test>::get().to_vec(), vec![bootnode.clone()]);
+		assert_ne!(Bootnodes::pop_payload(&bootnode.addr, EXPIRY).unwrap(), {
+			crate::pop_payload(&JAM_GENESIS_HASH, PARA_ID, &bootnode.addr, EXPIRY)
+		});
+	});
+}
+
+#[test]
+#[should_panic(expected = "invalid bootnode in genesis config")]
+fn genesis_bootnodes_need_the_jam_genesis_hash() {
+	let bootnode = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
+	let _ = RuntimeGenesisConfig {
+		bootnodes: crate::GenesisConfig { jam_genesis_hash: None, bootnodes: vec![bootnode] },
+		..Default::default()
+	}
+	.build_storage();
 }
 
 /// Step 3 restores the PoP check once its design settles on #13523.

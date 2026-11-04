@@ -116,7 +116,7 @@ pub struct SignCmd {
 	/// Para id to sign for. Defaults to the pallet's `ParaId` constant.
 	#[arg(long)]
 	pub para_id: Option<u32>,
-	/// JAM genesis hash to sign for. Defaults to the pallet's `JamGenesisHash` constant.
+	/// JAM genesis hash to sign for. Defaults to the pallet's stored `JamGenesisHash`.
 	#[arg(long)]
 	pub jam_genesis_hash: Option<H256>,
 	/// Do not contact the chain. Requires `--para-id` and `--jam-genesis-hash`.
@@ -140,7 +140,7 @@ async fn inspect(cmd: InspectCmd) -> Result<()> {
 		at: chain.at,
 		pallet: cmd.chain.pallet,
 		para_id: chain.constant("ParaId")?,
-		jam_genesis_hash: chain.constant("JamGenesisHash")?,
+		jam_genesis_hash: chain.jam_genesis_hash().await?,
 		max_bootnodes: chain.constant("MaxBootnodes")?,
 		max_addr_len: chain.constant("MaxAddrLen")?,
 		bootnodes: bootnodes.iter().map(BootnodeOut::from).collect(),
@@ -170,7 +170,12 @@ async fn sign(cmd: SignCmd) -> Result<()> {
 		};
 		let jam_genesis_hash = match cmd.jam_genesis_hash {
 			Some(hash) => hash,
-			None => chain.constant("JamGenesisHash")?,
+			None => chain.jam_genesis_hash().await?.ok_or_else(|| {
+				anyhow!(
+					"the chain has no JamGenesisHash set yet, so nothing can be listed; pass \
+					 --jam-genesis-hash to sign anyway"
+				)
+			})?,
 		};
 		let max_addr_len: u32 = chain.constant("MaxAddrLen")?;
 		if addr.len() > max_addr_len as usize {
@@ -212,7 +217,8 @@ struct InspectOut {
 	at: H256,
 	pallet: String,
 	para_id: u32,
-	jam_genesis_hash: H256,
+	/// `None` until root sets it; no bootnode can be listed before.
+	jam_genesis_hash: Option<H256>,
 	max_bootnodes: u32,
 	max_addr_len: u32,
 	bootnodes: Vec<BootnodeOut>,
@@ -449,6 +455,11 @@ impl Chain {
 			.await?;
 		raw.map(|raw| T::decode(&mut &raw.0[..]).context("decoding a storage value"))
 			.transpose()
+	}
+
+	/// The JAM genesis hash proofs of possession bind, `None` until root sets it.
+	async fn jam_genesis_hash(&self) -> Result<Option<H256>> {
+		self.storage(self.value_key("JamGenesisHash")).await
 	}
 
 	async fn bootnodes(&self) -> Result<Vec<StoredBootnode>> {

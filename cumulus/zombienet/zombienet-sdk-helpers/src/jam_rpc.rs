@@ -159,6 +159,27 @@ impl JamRpc {
 /// Proofs of single state items, in the form the Parachain Service verifies.
 #[cfg(feature = "jam")]
 impl JamRpc {
+	/// The header hash of JAM's genesis block, found by walking `parent` back from the finalized
+	/// block to slot 0. One call per block, so only for short test chains.
+	pub async fn genesis_header_hash(&self) -> anyhow::Result<[u8; 32]> {
+		let mut block: Value = self
+			.client
+			.request("finalizedBlock", rpc_params![])
+			.await
+			.context("finalizedBlock")?;
+		while block["slot"].as_u64() != Some(0) {
+			block = self
+				.client
+				.request("parent", rpc_params![&block["header_hash"]])
+				.await
+				.context("parent")?;
+			anyhow::ensure!(!block.is_null(), "JAM has no block at slot 0 to call genesis");
+		}
+		let hash: AnyHash = serde_json::from_value(block["header_hash"].clone())
+			.context("decoding the genesis header hash")?;
+		Ok(hash.0)
+	}
+
 	/// The posterior state root of block `at`.
 	pub async fn state_root(&self, at: &Value) -> anyhow::Result<[u8; 32]> {
 		let root: AnyHash =

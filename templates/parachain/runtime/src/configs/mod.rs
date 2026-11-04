@@ -432,24 +432,13 @@ impl pallet_bootnodes::PublishBootnodes for BootnodesToJamKv {
 	}
 }
 
-/// Stands in for the JAM genesis hash, which the para's genesis cannot carry: JAM's genesis embeds
-/// the para's genesis head. Unused while `pallet-bootnodes` does not check proofs of possession.
-#[cfg(jam)]
-pub struct JamGenesisHashPlaceholder;
-
-#[cfg(jam)]
-impl frame_support::traits::Get<sp_core::H256> for JamGenesisHashPlaceholder {
-	fn get() -> sp_core::H256 {
-		sp_core::H256::zero()
-	}
-}
-
-/// Root lists the para's bootnodes; every change is published to JAM through `JamKv`.
+/// Root lists the para's bootnodes; every change is published to JAM through `JamKv`. The JAM
+/// genesis hash is not in this para's genesis, which JAM's genesis embeds: root sets it after
+/// launch with `Bootnodes::set_jam_genesis_hash`, and nothing can be listed before.
 #[cfg(jam)]
 impl pallet_bootnodes::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type ParaId = SelfParaIdU32;
-	type JamGenesisHash = JamGenesisHashPlaceholder;
 	type MaxBootnodes = ConstU32<MAX_BOOTNODES>;
 	type MaxAddrLen = ConstU32<MAX_BOOTNODE_ADDR_LEN>;
 	type Publisher = BootnodesToJamKv;

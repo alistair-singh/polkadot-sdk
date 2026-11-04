@@ -38,6 +38,12 @@
 //! `/ws` or `/wss`: the shapes a node can dial a bootnode on. The runtime does not otherwise
 //! interpret it.
 //!
+//! The JAM genesis hash the payload binds is held in storage, [`JamGenesisHash`]: the genesis
+//! config sets it when it is known at launch, and `set_jam_genesis_hash` sets or changes it later,
+//! e.g. on a test network whose JAM genesis embeds this para's genesis head. No bootnode can be
+//! listed until it is set. A reader on another para checks entries against its own para's value:
+//! both are on the same JAM.
+//!
 //! **Not enforced yet:** the pallet does not check the proof of possession, so readers must.
 //! The origin, the address shape and the set's capacity are enforced.
 //!
@@ -57,6 +63,8 @@
 //! - `add_bootnode`: add a bootnode, or replace the entry of an already listed node key. Requires
 //!   `AdminOrigin`.
 //! - `remove_bootnode`: remove a bootnode by node key. Requires `AdminOrigin`.
+//! - `set_jam_genesis_hash`: set or change the JAM genesis hash proofs of possession bind. Requires
+//!   `AdminOrigin`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -240,10 +248,6 @@ pub mod pallet {
 		#[pallet::constant]
 		type ParaId: Get<u32>;
 
-		/// Genesis hash of the JAM chain this parachain runs on. Part of the signed payload.
-		#[pallet::constant]
-		type JamGenesisHash: Get<H256>;
-
 		/// Maximum number of bootnodes in the set. The SpecMsg address record allows 4.
 		///
 		/// Must not be lowered below the stored data without a migration.
@@ -272,18 +276,32 @@ pub mod pallet {
 	pub type Bootnodes<T: Config> =
 		StorageValue<_, BoundedVec<BootnodeOf<T>, T::MaxBootnodes>, ValueQuery>;
 
+	/// Genesis hash of the JAM chain this parachain runs on, which every proof of possession
+	/// binds. `None` until set; no bootnode can be listed before.
+	///
+	/// Changing it leaves the stored entries signed under the old hash: readers drop them until
+	/// they are re-signed and re-added.
+	#[pallet::storage]
+	pub type JamGenesisHash<T: Config> = StorageValue<_, H256, OptionQuery>;
+
 	#[pallet::genesis_config]
 	#[derive(DefaultNoBound)]
 	pub struct GenesisConfig<T: Config> {
-		/// Bootnodes listed from genesis. As with `add_bootnode`, the address shape and the set's
-		/// capacity are checked, and an entry failing either fails the build. They are stored but
-		/// not published.
+		/// The JAM genesis hash, if known at launch. A para that JAM's own genesis embeds cannot
+		/// know it and sets it after launch with `set_jam_genesis_hash`.
+		pub jam_genesis_hash: Option<H256>,
+		/// Bootnodes listed from genesis. As with `add_bootnode`, the JAM genesis hash must be
+		/// set, and the address shape and the set's capacity are checked; an entry failing
+		/// any check fails the build. They are stored but not published.
 		pub bootnodes: Vec<BootnodeOf<T>>,
 	}
 
 	#[pallet::genesis_build]
 	impl<T: Config> BuildGenesisConfig for GenesisConfig<T> {
 		fn build(&self) {
+			if let Some(hash) = self.jam_genesis_hash {
+				JamGenesisHash::<T>::put(hash);
+			}
 			for bootnode in &self.bootnodes {
 				Pallet::<T>::add(bootnode.clone(), false)
 					.expect("invalid bootnode in genesis config");
@@ -308,6 +326,8 @@ pub mod pallet {
 		},
 		/// A bootnode was removed from the set.
 		BootnodeRemoved { node_key: ed25519::Public },
+		/// The JAM genesis hash proofs of possession bind was set or changed.
+		JamGenesisHashSet { hash: H256 },
 	}
 
 	#[pallet::error]
@@ -322,6 +342,8 @@ pub mod pallet {
 		TooManyBootnodes,
 		/// No bootnode with this node key is listed.
 		UnknownBootnode,
+		/// The JAM genesis hash is not set yet, so no proof of possession can be checked.
+		JamGenesisHashUnset,
 	}
 
 	#[pallet::hooks]
@@ -354,20 +376,35 @@ pub mod pallet {
 			T::AdminOrigin::ensure_origin(origin)?;
 			Self::do_remove_bootnode(&node_key)
 		}
+
+		/// Set or change the genesis hash of the JAM chain this para runs on.
+		///
+		/// Entries already listed stay as they are, signed under the old hash if it changed.
+		#[pallet::call_index(2)]
+		#[pallet::weight(T::WeightInfo::set_jam_genesis_hash())]
+		pub fn set_jam_genesis_hash(origin: OriginFor<T>, hash: H256) -> DispatchResult {
+			T::AdminOrigin::ensure_origin(origin)?;
+			JamGenesisHash::<T>::put(hash);
+			Self::deposit_event(Event::JamGenesisHashSet { hash });
+			Ok(())
+		}
 	}
 }
 
 impl<T: Config> Pallet<T> {
 	/// The bytes a node must sign to be listed as a bootnode of this para at `addr` until
-	/// `expiry_slot`.
-	pub fn pop_payload(addr: &[u8], expiry_slot: u32) -> Vec<u8> {
-		pop_payload(&T::JamGenesisHash::get(), T::ParaId::get(), addr, expiry_slot)
+	/// `expiry_slot`, or `None` while the JAM genesis hash is not set.
+	pub fn pop_payload(addr: &[u8], expiry_slot: u32) -> Option<Vec<u8>> {
+		let jam_genesis_hash = JamGenesisHash::<T>::get()?;
+		Some(pop_payload(&jam_genesis_hash, T::ParaId::get(), addr, expiry_slot))
 	}
 
-	/// Whether `bootnode.sig` is a valid proof of possession for the entry.
+	/// Whether `bootnode.sig` is a valid proof of possession for the entry. `false` while the JAM
+	/// genesis hash is not set.
 	pub fn verify_pop(bootnode: &BootnodeOf<T>) -> bool {
-		let payload = Self::pop_payload(&bootnode.addr, bootnode.expiry_slot);
-		sp_io::crypto::ed25519_verify(&bootnode.sig, &payload, &bootnode.node_key)
+		Self::pop_payload(&bootnode.addr, bootnode.expiry_slot).is_some_and(|payload| {
+			sp_io::crypto::ed25519_verify(&bootnode.sig, &payload, &bootnode.node_key)
+		})
 	}
 
 	/// Insert `bootnode`, replacing an existing entry for the same node key, then
@@ -376,9 +413,10 @@ impl<T: Config> Pallet<T> {
 		Self::add(bootnode, true)
 	}
 
-	/// Insert `bootnode` if its address is valid and the set has room; publish the new set first
-	/// if `publish`.
+	/// Insert `bootnode` if the JAM genesis hash is set, its address is valid and the set has room;
+	/// publish the new set first if `publish`.
 	fn add(bootnode: BootnodeOf<T>, publish: bool) -> DispatchResult {
+		ensure!(JamGenesisHash::<T>::exists(), Error::<T>::JamGenesisHashUnset);
 		multiaddr::validate(&bootnode.addr).map_err(|e| match e {
 			multiaddr::Error::ContainsPeerId => Error::<T>::MultiaddrContainsPeerId,
 			_ => Error::<T>::InvalidMultiaddr,

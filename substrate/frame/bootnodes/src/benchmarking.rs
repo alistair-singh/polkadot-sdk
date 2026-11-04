@@ -66,10 +66,15 @@ fn max_multiaddr(max_len: u32) -> Vec<u8> {
 }
 
 /// A bootnode with a fresh key and a valid proof of possession over `addr` and `expiry_slot`.
+/// Sets a JAM genesis hash first if there is none.
 fn bootnode<T: Config>(expiry_slot: u32, addr: Vec<u8>) -> Result<BootnodeOf<T>, BenchmarkError> {
 	let addr: BoundedVec<u8, T::MaxAddrLen> =
 		addr.try_into().map_err(|_| BenchmarkError::Stop("MaxAddrLen is too small"))?;
-	let payload = Pallet::<T>::pop_payload(&addr, expiry_slot);
+	if !JamGenesisHash::<T>::exists() {
+		JamGenesisHash::<T>::put(H256::repeat_byte(0x4a));
+	}
+	let payload = Pallet::<T>::pop_payload(&addr, expiry_slot)
+		.ok_or(BenchmarkError::Stop("the JAM genesis hash was just set"))?;
 	let (node_key, sig) = T::BenchmarkHelper::sign(&payload);
 	Ok(Bootnode { addr, node_key, expiry_slot, sig })
 }
@@ -118,6 +123,19 @@ mod benchmarks {
 		_(origin as T::RuntimeOrigin, node_key);
 
 		assert!(!Bootnodes::<T>::get().iter().any(|b| b.node_key == node_key));
+		Ok(())
+	}
+
+	#[benchmark]
+	fn set_jam_genesis_hash() -> Result<(), BenchmarkError> {
+		let hash = H256::repeat_byte(0x4a);
+		let origin =
+			T::AdminOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
+
+		#[extrinsic_call]
+		_(origin as T::RuntimeOrigin, hash);
+
+		assert_eq!(JamGenesisHash::<T>::get(), Some(hash));
 		Ok(())
 	}
 

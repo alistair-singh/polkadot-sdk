@@ -19,7 +19,7 @@
 
 use crate as pallet_bootnodes;
 use core::cell::{Cell, RefCell};
-use frame_support::{derive_impl, parameter_types, traits::ConstU32};
+use frame_support::{derive_impl, traits::ConstU32};
 use frame_system::EnsureRoot;
 use sp_core::H256;
 use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
@@ -43,14 +43,12 @@ pub const PARA_ID: u32 = 2_000;
 pub const MAX_BOOTNODES: u32 = 4;
 pub const MAX_ADDR_LEN: u32 = 128;
 
-parameter_types! {
-	pub JamGenesisHash: H256 = H256::repeat_byte(0x4a);
-}
+/// The JAM genesis hash [`new_test_ext`] sets.
+pub const JAM_GENESIS_HASH: H256 = H256::repeat_byte(0x4a);
 
 impl pallet_bootnodes::Config for Test {
 	type AdminOrigin = EnsureRoot<u64>;
 	type ParaId = ConstU32<PARA_ID>;
-	type JamGenesisHash = JamGenesisHash;
 	type MaxBootnodes = ConstU32<MAX_BOOTNODES>;
 	type MaxAddrLen = ConstU32<MAX_ADDR_LEN>;
 	type Publisher = RecordingPublisher;
@@ -90,8 +88,17 @@ pub fn fail_publishing(fail: bool) {
 	PUBLISH_FAILS.set(fail);
 }
 
+/// Test externalities with [`JAM_GENESIS_HASH`] set and no bootnodes.
 pub fn new_test_ext() -> sp_io::TestExternalities {
-	let storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+	let storage = RuntimeGenesisConfig {
+		bootnodes: pallet_bootnodes::GenesisConfig {
+			jam_genesis_hash: Some(JAM_GENESIS_HASH),
+			..Default::default()
+		},
+		..Default::default()
+	}
+	.build_storage()
+	.unwrap();
 	let mut ext = sp_io::TestExternalities::new(storage);
 	// The default `BenchmarkHelper` signs through the keystore.
 	ext.register_extension(KeystoreExt::new(MemoryKeystore::new()));
