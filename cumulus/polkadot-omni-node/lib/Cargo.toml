@@ -44,6 +44,9 @@ parachain-authorizer = { path = "../../../../parachain-service/authorizer", feat
 parachain-authorizer-ed25519 = { path = "../../../../parachain-service/authorizer-ed25519" }
 parachain-authorizer-sr25519 = { path = "../../../../parachain-service/authorizer-sr25519" }
 parachain-service-core = { path = "../../../../parachain-service/core", features = ["std"] }
+# The bootnode record other paras publish to JAM, and the key-value key it sits under.
+pallet-bootnodes = { workspace = true, default-features = true }
+pallet-jam-kv = { workspace = true, default-features = true }
 
 # Local
 frame-metadata = { workspace = true, default-features = true }
