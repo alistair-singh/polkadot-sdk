@@ -18,7 +18,7 @@
 //! Tests for `pallet_bootnodes`.
 
 use crate::{mock::*, Bootnode, BootnodeOf, Bootnodes as BootnodeSet, Error, Event};
-use codec::Encode;
+use codec::{Decode, Encode};
 use frame_support::{assert_noop, assert_ok, BoundedVec};
 use multiaddr::Multiaddr;
 use sp_core::{crypto::Pair as _, ed25519, H256};
@@ -61,6 +61,38 @@ fn pop_payload_has_the_documented_layout() {
 
 	// The pallet binds its own constants.
 	assert_eq!(Bootnodes::pop_payload(&address, 7), payload);
+}
+
+/// Readers on other paras decode the value under `bootnodes/v1` with their own copy of the type,
+/// so its encoding must not change without a new key name.
+#[test]
+fn the_v1_set_encoding_is_fixed() {
+	let bootnode = Bootnode {
+		addr: addr("/ip4/1.2.3.4/tcp/30333"),
+		node_key: ed25519::Public::from_raw([1; 32]),
+		expiry_slot: 7,
+		sig: ed25519::Signature::from_raw([2; 64]),
+	};
+	let expected = [
+		"0x",
+		// One entry.
+		"04",
+		// `addr`: 8 bytes, `/ip4/1.2.3.4/tcp/30333`.
+		"20",
+		"0401020304",
+		"06767d",
+		// `node_key`.
+		&"01".repeat(32),
+		// `expiry_slot`, little-endian.
+		"07000000",
+		// `sig`.
+		&"02".repeat(64),
+	]
+	.concat();
+
+	assert_eq!(sp_core::bytes::to_hex(&vec![bootnode.clone()].encode(), false), expected);
+	let bytes = sp_core::bytes::from_hex(&expected).unwrap();
+	assert_eq!(Vec::<BootnodeOf<Test>>::decode(&mut &bytes[..]).unwrap(), vec![bootnode]);
 }
 
 #[test]

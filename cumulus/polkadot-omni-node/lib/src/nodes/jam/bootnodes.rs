@@ -21,11 +21,14 @@
 //! listed node to the network as a known address, `addr/p2p/<peer id of node_key>`, so this
 //! node can dial the other para's nodes.
 //!
+//! It follows JAM's finalized chain, so it never acts on a value that is later reverted. That
+//! only delays a change to the set by JAM's finality lag: connections already made stay up.
+//!
 //! The reader checks each entry's address the way `pallet-bootnodes` does
 //! ([`pallet_bootnodes::multiaddr::validate`]), since root on the other para can write the value
 //! without the pallet. It drops an entry once JAM's slot is past its `expiry_slot`, the consent
-//! lease the operator signed: the set is checked again on every JAM block, not only when it
-//! changes, so an entry expires even if the other para never writes again. The proof of
+//! lease the operator signed: the set is checked again on every finalized JAM block, not only when
+//! it changes, so an entry expires even if the other para never writes again. The proof of
 //! possession is not checked yet.
 
 use super::LOG_TARGET;
@@ -114,7 +117,7 @@ enum Event {
 	Block(jam_interface::BlockDesc),
 }
 
-/// Follow `para_id`'s published set at JAM's best block and pass every newly listed node to
+/// Follow `para_id`'s published set at JAM's finalized block and pass every newly listed node to
 /// `add_known_address`. Returns when either subscription ends.
 ///
 /// A node that drops off the set, or whose lease expires, is only logged: the network has no
@@ -127,8 +130,8 @@ pub(crate) async fn follow<Jam: JamStateSource + JamChainSource + ?Sized>(
 ) {
 	let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
 	let streams = futures::try_join!(
-		jam.service_value_stream(parachain_service, &key, false),
-		jam.best_block_stream(),
+		jam.service_value_stream(parachain_service, &key, true),
+		jam.finalized_block_stream(),
 	);
 	let (values, blocks) = match streams {
 		Ok(streams) => streams,
@@ -277,6 +280,171 @@ mod tests {
 		assert_eq!(unexpired(&set, 7), vec![a, forever.clone()]);
 		assert_eq!(unexpired(&set, 8), vec![forever.clone()]);
 		assert_eq!(unexpired(&set, u32::MAX), vec![forever]);
+	}
+
+	/// A JAM source with scripted value updates. It records whether the reader asked for the
+	/// finalized chain, and fails the test if the reader asks for the best one.
+	#[derive(Default)]
+	struct ScriptedJam {
+		values: std::sync::Mutex<Vec<jam_interface::ChainSubUpdate<Option<Vec<u8>>>>>,
+		finalized: std::sync::Mutex<Option<bool>>,
+	}
+
+	#[async_trait::async_trait]
+	impl JamStateSource for ScriptedJam {
+		async fn service_value_stream(
+			&self,
+			_service: ServiceId,
+			_key: &[u8],
+			finalized: bool,
+		) -> jam_interface::Result<
+			jam_interface::BoxStream<'static, jam_interface::ChainSubUpdate<Option<Vec<u8>>>>,
+		> {
+			*self.finalized.lock().unwrap() = Some(finalized);
+			let updates = std::mem::take(&mut *self.values.lock().unwrap());
+			// The value stream ends after its updates, which ends the reader.
+			Ok(futures::stream::iter(updates).boxed())
+		}
+
+		async fn state_value(
+			&self,
+			_: jam_interface::HeaderHash,
+			_: jam_interface::StorageKey,
+		) -> jam_interface::Result<Option<Vec<u8>>> {
+			unimplemented!("the reader only subscribes")
+		}
+
+		async fn state_value_stream(
+			&self,
+			_: jam_interface::StorageKey,
+			_: bool,
+		) -> jam_interface::Result<
+			jam_interface::BoxStream<'static, jam_interface::ChainSubUpdate<Option<Vec<u8>>>>,
+		> {
+			unimplemented!("the reader only reads service values")
+		}
+
+		async fn state_proof(
+			&self,
+			_: jam_interface::HeaderHash,
+			_: jam_interface::StorageKey,
+			_: jam_interface::StorageKey,
+			_: u32,
+		) -> jam_interface::Result<jam_interface::RangeProof> {
+			unimplemented!("the reader reads no proofs")
+		}
+
+		async fn service_value(
+			&self,
+			_: jam_interface::HeaderHash,
+			_: ServiceId,
+			_: &[u8],
+		) -> jam_interface::Result<Option<Vec<u8>>> {
+			unimplemented!("the reader only subscribes")
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl JamChainSource for ScriptedJam {
+		async fn finalized_block_stream(
+			&self,
+		) -> jam_interface::Result<jam_interface::BoxStream<'static, jam_interface::BlockDesc>>
+		{
+			Ok(futures::stream::pending().boxed())
+		}
+
+		async fn best_block_stream(
+			&self,
+		) -> jam_interface::Result<jam_interface::BoxStream<'static, jam_interface::BlockDesc>>
+		{
+			panic!("the reader must follow JAM's finalized chain, not its best block");
+		}
+
+		async fn best_block(&self) -> jam_interface::Result<jam_interface::BlockDesc> {
+			unimplemented!()
+		}
+
+		async fn finalized_block(&self) -> jam_interface::Result<jam_interface::BlockDesc> {
+			unimplemented!()
+		}
+
+		async fn parent(
+			&self,
+			_: jam_interface::HeaderHash,
+		) -> jam_interface::Result<jam_interface::BlockDesc> {
+			unimplemented!()
+		}
+
+		async fn header(&self, _: jam_interface::HeaderHash) -> jam_interface::Result<Vec<u8>> {
+			unimplemented!()
+		}
+
+		async fn state_root(
+			&self,
+			_: jam_interface::HeaderHash,
+		) -> jam_interface::Result<jam_interface::StateRootHash> {
+			unimplemented!()
+		}
+
+		async fn beefy_root(
+			&self,
+			_: jam_interface::HeaderHash,
+		) -> jam_interface::Result<jam_interface::MmrPeakHash> {
+			unimplemented!()
+		}
+
+		async fn parameters(&self) -> jam_interface::Result<jam_interface::VersionedParameters> {
+			unimplemented!()
+		}
+	}
+
+	impl ScriptedJam {
+		fn with_values(values: impl IntoIterator<Item = Option<Vec<u8>>>) -> Arc<Self> {
+			let values = values
+				.into_iter()
+				.map(|value| jam_interface::ChainSubUpdate {
+					header_hash: Default::default(),
+					slot: 0,
+					value,
+				})
+				.collect();
+			Arc::new(Self { values: std::sync::Mutex::new(values), ..Default::default() })
+		}
+	}
+
+	/// Run the reader over `jam`'s scripted updates; the nodes it handed to the network, in order.
+	async fn learned(jam: Arc<ScriptedJam>) -> Vec<KnownBootnode> {
+		let learned = std::sync::Mutex::new(Vec::new());
+		follow(jam, 1337, 0, |peer_id, addr| learned.lock().unwrap().push((peer_id, addr))).await;
+		learned.into_inner().unwrap()
+	}
+
+	/// A value that is later reverted must never be dialed, so the reader subscribes to the
+	/// finalized chain, for the value and for the clock its leases are checked against.
+	#[tokio::test]
+	async fn the_reader_follows_finalized_jam() {
+		let jam = ScriptedJam::with_values([Some(vec![entry(1, "/ip4/127.0.0.1/tcp/1")].encode())]);
+
+		assert_eq!(learned(jam.clone()).await, vec![known(1, "/ip4/127.0.0.1/tcp/1")]);
+		assert_eq!(*jam.finalized.lock().unwrap(), Some(true));
+	}
+
+	/// Message delivery matters more than which node delivers: a value that does not decode
+	/// keeps the nodes listed before, so the reader does not forget peers it can still use.
+	#[tokio::test]
+	async fn a_value_that_does_not_decode_keeps_the_nodes_listed_before() {
+		let (a, b) = (entry(1, "/ip4/127.0.0.1/tcp/1"), entry(2, "/ip4/127.0.0.1/tcp/2"));
+		let jam = ScriptedJam::with_values([
+			Some(vec![a.clone()].encode()),
+			Some(vec![0x04, 0xff]),
+			Some(vec![a, b].encode()),
+		]);
+
+		// Had the garbage cleared the set, the last update would hand `a` to the network again.
+		assert_eq!(
+			learned(jam).await,
+			vec![known(1, "/ip4/127.0.0.1/tcp/1"), known(2, "/ip4/127.0.0.1/tcp/2")],
+		);
 	}
 
 	/// The reader hands each node to the network once, and names the ones that left the set.
