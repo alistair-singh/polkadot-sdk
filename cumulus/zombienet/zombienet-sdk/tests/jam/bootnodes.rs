@@ -25,11 +25,13 @@
 //! A second test runs two paras. Para B's collator follows para A's set (`--jam-bootnodes-from`)
 //! and, once A lists its collator `alpha`, dials it. The two run different chains, so `alpha`
 //! refuses B's sync protocol; the connection itself is what shows B found A through JAM: B has
-//! no other way to learn `alpha`'s address, and the handshake checks the peer id.
+//! no other way to learn `alpha`'s address, and the handshake checks the peer id. Root on A then
+//! writes a set past the pallet with `JamKv::set_kv`, and B dials only the entries the pallet
+//! would have accepted.
 //!
-//! `pallet-bootnodes` does not check entries yet. The entries are signed under the runtime's
-//! placeholder JAM genesis hash, `H256::zero()`, so they stop verifying once the runtime uses the
-//! real hash; the test must then sign under that hash.
+//! `pallet-bootnodes` does not check the proof of possession yet. The entries are signed under the
+//! runtime's placeholder JAM genesis hash, `H256::zero()`, so they stop verifying once the runtime
+//! uses the real hash; the test must then sign under that hash.
 
 use anyhow::Context;
 use codec::Encode;
@@ -111,10 +113,11 @@ async fn bootnodes_are_published_to_jam() -> Result<(), anyhow::Error> {
 #[tokio::test(flavor = "multi_thread")]
 async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> {
 	let (a, b) = (Para::new(0, 0, &["alpha", "beta"]), Para::new(1, 1, &["gamma"]));
-	let alpha_port = free_port()?;
+	let (alpha_port, beta_port) = (free_port()?, free_port()?);
 	let mut options = SpawnOptions::new(TINY_CORES);
 	options.collators = HashMap::from([
 		("alpha".to_string(), CollatorOptions { p2p_port: Some(alpha_port), ..Default::default() }),
+		("beta".to_string(), CollatorOptions { p2p_port: Some(beta_port), ..Default::default() }),
 		(
 			"gamma".to_string(),
 			CollatorOptions {
@@ -134,29 +137,44 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 		check_max_addr_len(&jam, &a).await?;
 		wait_for_log(&jam, "gamma", &["Following the para's bootnodes on JAM."]).await?;
 
-		// zombienet derives a node's network key from its name.
-		let alpha = ed25519::Pair::from_seed(&sp_crypto_hashing::sha2_256(b"alpha"));
-		let alpha_peer = peer_id(&alpha);
-		anyhow::ensure!(
-			connections_to(&jam, "gamma", &alpha_peer).await?.is_empty(),
-			"gamma reached alpha before para 0 listed it",
-		);
+		let (alpha, beta) = (network_key("alpha"), network_key("beta"));
+		let (alpha_peer, beta_peer) = (peer_id(&alpha), peer_id(&beta));
+		for peer in [&alpha_peer, &beta_peer] {
+			anyhow::ensure!(
+				connections_to(&jam, "gamma", peer).await?.is_empty(),
+				"gamma reached {peer} before para 0 listed it",
+			);
+		}
 
 		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
 		let entry = signed(&alpha, a.id, &format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws"));
 		add_bootnode(&jam, &a, &entry).await?;
 		wait_for_set(&jam, &kv_storage_key(a.id, BOOTNODES_KEY), &[&entry]).await?;
 		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &alpha_peer]).await?;
-		let connected = Instant::now();
-		while connections_to(&jam, "gamma", &alpha_peer).await?.is_empty() {
-			anyhow::ensure!(connected.elapsed() < DIAL_BUDGET, "gamma never connected to alpha");
-			tokio::time::sleep(Duration::from_secs(2)).await;
-		}
-		log::info!("gamma connected to alpha ({alpha_peer}) after {:?}", connected.elapsed());
+		wait_for_connection(&jam, "gamma", &alpha_peer).await?;
 
 		remove_bootnode(&jam, &a, &alpha.public()).await?;
 		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &alpha_peer])
-			.await
+			.await?;
+
+		// Root writes the set past the pallet: an entry the pallet would reject, then `beta`.
+		let rejected_key = node_key(9);
+		let rejected = signed(&rejected_key, a.id, "/ip4/127.0.0.1/udp/30333/quic-v1");
+		let beta_entry = signed(&beta, a.id, &format!("/ip4/127.0.0.1/tcp/{beta_port}/ws"));
+		// A `Vec`, not an array: SCALE gives arrays no length prefix.
+		let set = vec![&rejected, &beta_entry];
+		set_kv(&jam, &a, BOOTNODES_KEY, &set.encode()).await?;
+		wait_for_set(&jam, &kv_storage_key(a.id, BOOTNODES_KEY), &set).await?;
+		// Both entries come from one update, so once `beta` is learned the other was skipped.
+		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
+		let rejected_peer = peer_id(&rejected_key);
+		anyhow::ensure!(
+			log_lines_with(&jam, "gamma", &["Learned a bootnode", &rejected_peer])
+				.await?
+				.is_empty(),
+			"gamma learned the entry the pallet would reject",
+		);
+		wait_for_connection(&jam, "gamma", &beta_peer).await
 	}
 	.await;
 
@@ -167,6 +185,22 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 /// How long a node may take to dial a peer it just learned: its peerset fills free slots every
 /// second or so.
 const DIAL_BUDGET: Duration = Duration::from_secs(60);
+
+/// The network key zombienet derives from a node's name.
+fn network_key(name: &str) -> ed25519::Pair {
+	ed25519::Pair::from_seed(&sp_crypto_hashing::sha2_256(name.as_bytes()))
+}
+
+/// Poll `name`'s log until litep2p established a connection with `peer`.
+async fn wait_for_connection(jam: &JamNetwork, name: &str, peer: &str) -> anyhow::Result<()> {
+	let started = Instant::now();
+	while connections_to(jam, name, peer).await?.is_empty() {
+		anyhow::ensure!(started.elapsed() < DIAL_BUDGET, "{name} never connected to {peer}");
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+	log::info!("{name} connected to {peer} after {:?}", started.elapsed());
+	Ok(())
+}
 
 /// The base58 peer id of the node whose network key is `pair`.
 fn peer_id(pair: &ed25519::Pair) -> String {
@@ -228,7 +262,7 @@ async fn add_bootnode(jam: &JamNetwork, para: &Para, entry: &Bootnode) -> anyhow
 		("expiry_slot", Value::u128(entry.expiry_slot.into())),
 		("sig", Value::from_bytes(entry.sig)),
 	]);
-	submit_bootnodes(jam, para, "add_bootnode", vec![bootnode]).await
+	submit(jam, para, "Bootnodes", "add_bootnode", vec![bootnode]).await
 }
 
 async fn remove_bootnode(
@@ -236,7 +270,13 @@ async fn remove_bootnode(
 	para: &Para,
 	node_key: &ed25519::Public,
 ) -> anyhow::Result<()> {
-	submit_bootnodes(jam, para, "remove_bootnode", vec![Value::from_bytes(node_key)]).await
+	submit(jam, para, "Bootnodes", "remove_bootnode", vec![Value::from_bytes(node_key)]).await
+}
+
+/// Write `value` under the para's `key` with `JamKv::set_kv`, past `pallet-bootnodes`.
+async fn set_kv(jam: &JamNetwork, para: &Para, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+	let fields = vec![Value::from_bytes(key), Value::from_bytes(value)];
+	submit(jam, para, "JamKv", "set_kv", fields).await
 }
 
 /// Fail if the runtime's address bound is not the one [`Bootnode`] uses.
@@ -255,22 +295,23 @@ async fn check_max_addr_len(jam: &JamNetwork, para: &Para) -> anyhow::Result<()>
 	Ok(())
 }
 
-/// Submit `Bootnodes::<call>(fields)` as sudo through the para's first collator.
-async fn submit_bootnodes(
+/// Submit `<pallet>::<call>(fields)` as sudo through the para's first collator.
+async fn submit(
 	jam: &JamNetwork,
 	para: &Para,
+	pallet: &str,
 	call: &str,
 	fields: Vec<Value>,
 ) -> anyhow::Result<()> {
 	let name = para.collators.first().context("the para has no collator")?;
 	let client = jam.collator_client(name).await?;
-	let (sudo, alice) = (sudo_call(dynamic("Bootnodes", call, fields)), dev::alice());
+	let (sudo, alice) = (sudo_call(dynamic(pallet, call, fields)), dev::alice());
 	let submit = submit_extrinsic_and_wait_for_best_block_success(&client, &sudo, &alice);
 	// The helper waits forever for a block that never comes, e.g. when the collator stalls.
 	let block = tokio::time::timeout(SUBMIT_BUDGET, submit).await.map_err(|_| {
-		anyhow::anyhow!("Bootnodes::{call} not in a best block after {SUBMIT_BUDGET:?}")
+		anyhow::anyhow!("{pallet}::{call} not in a best block after {SUBMIT_BUDGET:?}")
 	})??;
-	log::info!("Bootnodes::{call} included in para block {block:?}");
+	log::info!("{pallet}::{call} included in para block {block:?}");
 	Ok(())
 }
 

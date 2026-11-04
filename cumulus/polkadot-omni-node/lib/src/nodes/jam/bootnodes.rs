@@ -21,9 +21,9 @@
 //! listed node to the network as a known address, `addr/p2p/<peer id of node_key>`, so this
 //! node can dial the other para's nodes.
 //!
-//! Entries are not checked yet: the proof of possession and `expiry_slot` are ignored, so a
-//! reader trusts whatever the other para's admin listed. Only entries that cannot be dialed at
-//! all are skipped.
+//! The reader checks each entry's address the way `pallet-bootnodes` does
+//! ([`pallet_bootnodes::multiaddr::validate`]), since root on the other para can write the value
+//! without the pallet. The proof of possession and `expiry_slot` are not checked yet.
 
 use super::LOG_TARGET;
 use codec::Decode;
@@ -47,12 +47,18 @@ pub(crate) fn dialable(value: Option<&[u8]>) -> Result<Vec<KnownBootnode>, codec
 	Ok(set.iter().filter_map(known_bootnode).collect())
 }
 
-/// `addr/p2p/<peer id of node_key>`, or `None` for an entry no node could dial.
+/// `addr/p2p/<peer id of node_key>`, or `None` for an entry the pallet would not have accepted
+/// or no node could dial.
 fn known_bootnode(bootnode: &Bootnode) -> Option<KnownBootnode> {
 	let Some(peer_id) = PeerId::from_ed25519(&bootnode.node_key.0) else {
 		tracing::debug!(target: LOG_TARGET, node_key = ?bootnode.node_key, "Skipping a bootnode: its node key is no ed25519 key.");
 		return None;
 	};
+	// Also rejects a `/p2p/` component: the peer id comes from the node key, not the address.
+	if let Err(error) = pallet_bootnodes::multiaddr::validate(&bootnode.addr) {
+		tracing::debug!(target: LOG_TARGET, %peer_id, ?error, "Skipping a bootnode: its address is not one a bootnode may list.");
+		return None;
+	}
 	let addr = match Multiaddr::try_from(bootnode.addr.to_vec()) {
 		Ok(addr) => addr,
 		Err(error) => {
@@ -60,10 +66,6 @@ fn known_bootnode(bootnode: &Bootnode) -> Option<KnownBootnode> {
 			return None;
 		},
 	};
-	if addr.iter().any(|protocol| matches!(protocol, Protocol::P2p(_))) {
-		tracing::debug!(target: LOG_TARGET, %peer_id, %addr, "Skipping a bootnode: the peer id comes from the node key, not the address.");
-		return None;
-	}
 	Some((peer_id, addr.with(Protocol::P2p(peer_id.into()))))
 }
 
@@ -176,19 +178,26 @@ mod tests {
 		assert!(dialable(Some(&[0x04, 0xff])).is_err());
 	}
 
-	/// The reader checks nothing yet, but it can only dial what parses, and the peer id has to be
-	/// the one the node key gives: an address naming its own would be dialed as someone else.
+	/// Root on the other para can write any set, so the reader skips every address the pallet
+	/// would have rejected and keeps the rest. An address naming its own peer id would be
+	/// dialed as someone else.
 	#[test]
-	fn entries_no_node_could_dial_are_skipped() {
+	fn entries_the_pallet_would_reject_are_skipped() {
 		let mut garbage = entry(1, "/ip4/127.0.0.1/tcp/1");
 		garbage.addr = vec![0xff, 0xff].try_into().expect("short; qed");
 		let with_peer_id = entry(2, &format!("/ip4/127.0.0.1/tcp/2/p2p/{}", peer(9)));
-		let fine = entry(3, "/ip4/127.0.0.1/tcp/3");
+		let udp = entry(3, "/ip4/127.0.0.1/udp/3/quic-v1");
+		let memory = entry(4, "/memory/4");
+		// `/ip4/127.0.0.1/tcp/5` with the ip4 code as a non-minimal varint.
+		let mut non_canonical = entry(5, "/ip4/127.0.0.1/tcp/5");
+		non_canonical.addr = [&[0x84, 0x00][..], &non_canonical.addr[1..]]
+			.concat()
+			.try_into()
+			.expect("short; qed");
+		let fine = entry(6, "/ip4/127.0.0.1/tcp/6");
+		let set = vec![garbage, with_peer_id, udp, memory, non_canonical, fine];
 
-		assert_eq!(
-			dialable(Some(&vec![garbage, with_peer_id, fine].encode())),
-			Ok(vec![known(3, "/ip4/127.0.0.1/tcp/3")]),
-		);
+		assert_eq!(dialable(Some(&set.encode())), Ok(vec![known(6, "/ip4/127.0.0.1/tcp/6")]));
 	}
 
 	/// The reader hands each node to the network once, and names the ones that left the set.
