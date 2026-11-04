@@ -255,6 +255,22 @@ fn same_node_key_replaces_the_entry_in_place_regardless_of_expiry() {
 	});
 }
 
+/// With no sequence number, the admin can put back an entry its node already replaced: its old,
+/// unexpired signature still verifies. Open question 2 on #13523; pinned until it is answered.
+#[test]
+fn a_replaced_entry_can_be_restored_with_its_old_signature() {
+	new_test_ext().execute_with(|| {
+		let node = pair(1);
+		let original = signed(&node, EXPIRY, "/ip4/1.2.3.4/tcp/1");
+		let moved = signed(&node, EXPIRY + 10, "/ip4/1.2.3.4/tcp/2");
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), original.clone()));
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), moved));
+
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), original.clone()));
+		assert_eq!(BootnodeSet::<Test>::get().to_vec(), vec![original]);
+	});
+}
+
 #[test]
 fn set_is_bounded_by_max_bootnodes() {
 	new_test_ext().execute_with(|| {

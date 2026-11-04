@@ -25,7 +25,9 @@
 //! A second test runs two paras. Para B's collator follows para A's set (`--jam-bootnodes-from`)
 //! and, once A lists its collator `alpha`, dials it. The two run different chains, so `alpha`
 //! refuses B's sync protocol; the connection itself is what shows B found A through JAM: B has
-//! no other way to learn `alpha`'s address, and the handshake checks the peer id. Root on A then
+//! no other way to learn `alpha`'s address, and the handshake checks the peer id. `alpha` is
+//! listed at a dead port first and then moved, so the connection also shows the reader follows a
+//! replaced entry. Root on A then
 //! writes a set past the pallet with `JamKv::set_kv`, and B dials only the entries the pallet
 //! would have accepted and whose lease holds: an entry that expired before it was written is
 //! never learned, and `beta`'s short lease expires on B without A writing again.
@@ -149,12 +151,24 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 			);
 		}
 
+		// `alpha` is listed first at a port nothing listens on, then moved to its own: the
+		// reader passes the new address on, and `gamma` dials `alpha` there.
 		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
-		let entry = signed(&alpha, a.id, &format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws"));
+		let key = kv_storage_key(a.id, BOOTNODES_KEY);
+		let stale_addr = format!("/ip4/127.0.0.1/tcp/{}/ws", free_port()?);
+		let stale = signed(&alpha, a.id, &stale_addr);
+		add_bootnode(&jam, &a, &stale).await?;
+		wait_for_set(&jam, &key, &[&stale]).await?;
+		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &stale_addr]).await?;
+
+		let alpha_addr = format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws");
+		let entry = signed(&alpha, a.id, &alpha_addr);
 		add_bootnode(&jam, &a, &entry).await?;
-		wait_for_set(&jam, &kv_storage_key(a.id, BOOTNODES_KEY), &[&entry]).await?;
-		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &alpha_peer]).await?;
-		wait_for_connection(&jam, "gamma", &alpha_peer).await?;
+		wait_for_set(&jam, &key, &[&entry]).await?;
+		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &alpha_addr]).await?;
+		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &stale_addr])
+			.await?;
+		wait_for_connection(&jam, "gamma", &alpha_peer, &alpha_addr).await?;
 
 		remove_bootnode(&jam, &a, &alpha.public()).await?;
 		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &alpha_peer])
@@ -171,16 +185,16 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 		// A `Vec`, not an array: SCALE gives arrays no length prefix.
 		let set = vec![&rejected, &expired, &beta_entry];
 		set_kv(&jam, &a, BOOTNODES_KEY, &set.encode()).await?;
-		wait_for_set(&jam, &kv_storage_key(a.id, BOOTNODES_KEY), &set).await?;
+		wait_for_set(&jam, &key, &set).await?;
 		// All entries come from one update, so once `beta` is learned the others were skipped.
 		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
 		let skipped = [(&rejected_key, "the pallet would reject"), (&expired_key, "had expired")];
-		for (key, why) in skipped {
-			let peer = peer_id(key);
+		for (node, why) in skipped {
+			let peer = peer_id(node);
 			let learned = log_lines_with(&jam, "gamma", &["Learned a bootnode", &peer]).await?;
 			anyhow::ensure!(learned.is_empty(), "gamma learned the entry that {why}");
 		}
-		wait_for_connection(&jam, "gamma", &beta_peer).await?;
+		wait_for_connection(&jam, "gamma", &beta_peer, &beta_addr).await?;
 
 		// The value does not change again; `beta` drops off once JAM passes its expiry slot.
 		wait_for_log(&jam, "gamma", &["A bootnode of para 0 expired.", &beta_peer]).await?;
@@ -210,14 +224,24 @@ fn network_key(name: &str) -> ed25519::Pair {
 	ed25519::Pair::from_seed(&sp_crypto_hashing::sha2_256(name.as_bytes()))
 }
 
-/// Poll `name`'s log until litep2p established a connection with `peer`.
-async fn wait_for_connection(jam: &JamNetwork, name: &str, peer: &str) -> anyhow::Result<()> {
+/// Poll `name`'s log until litep2p established a connection it dialed to `peer` at `addr`.
+async fn wait_for_connection(
+	jam: &JamNetwork,
+	name: &str,
+	peer: &str,
+	addr: &str,
+) -> anyhow::Result<()> {
+	let dialed = format!("endpoint=Dialer {{ address: {addr}/p2p/{peer}");
+	let needles = ["on connection established completed", dialed.as_str()];
 	let started = Instant::now();
-	while connections_to(jam, name, peer).await?.is_empty() {
-		anyhow::ensure!(started.elapsed() < DIAL_BUDGET, "{name} never connected to {peer}");
+	while log_lines_with(jam, name, &needles).await?.is_empty() {
+		anyhow::ensure!(
+			started.elapsed() < DIAL_BUDGET,
+			"{name} never connected to {peer} at {addr}",
+		);
 		tokio::time::sleep(Duration::from_secs(2)).await;
 	}
-	log::info!("{name} connected to {peer} after {:?}", started.elapsed());
+	log::info!("{name} connected to {peer} at {addr} after {:?}", started.elapsed());
 	Ok(())
 }
 
