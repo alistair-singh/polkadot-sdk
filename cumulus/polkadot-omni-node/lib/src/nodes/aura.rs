@@ -658,6 +658,7 @@ where
 		};
 
 		let database_path = config.database.path().map(|p| p.to_path_buf());
+		let bootnodes_network = network.clone();
 
 		let _rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
 			network,
@@ -710,6 +711,7 @@ where
 			let para_backend = backend.clone();
 			let keystore = keystore_container.keystore();
 			let spawn_essential = task_manager.spawn_essential_handle();
+			let spawn = task_manager.spawn_handle();
 			let announce_block = announce_block.clone();
 			let block_import = block_import.clone();
 			async move {
@@ -726,6 +728,24 @@ where
 				};
 				let jam = Arc::new(jam);
 				spawn_essential.spawn_essential("jam-rpc-worker", Some("jam"), Box::pin(worker));
+
+				for &other_para in &jam_params.bootnodes_from {
+					let network = bootnodes_network.clone();
+					// Proofs of possession are checked against this para's own JAM genesis hash:
+					// both paras are on the same JAM.
+					let own_client = client.clone();
+					spawn.spawn(
+						"jam-bootnodes",
+						Some("jam"),
+						Box::pin(jam::bootnodes::follow(
+							jam.clone(),
+							jam_params.service_id,
+							other_para,
+							move || jam::bootnodes::own_jam_genesis_hash(&*own_client),
+							move |peer_id, addr| network.add_known_address(peer_id, addr),
+						)),
+					);
+				}
 
 				let best_heads = match jam::para_header_stream::<Block, _>(
 					&*jam,

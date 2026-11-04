@@ -64,6 +64,9 @@ polkadot-sdk = { workspace = true, default-features = false, features = [
 cumulus-pallet-parachain-system = { workspace = true }
 # Writes the para's key/value storage in the Parachain Service; wired in only under `cfg(jam)`.
 pallet-jam-kv = { workspace = true }
+# Lists the para's bootnodes and publishes them through `pallet-jam-kv`; wired in only under
+# `cfg(jam)`.
+pallet-bootnodes = { workspace = true }
 
 # `min_stack_size!`, for the PolkaVM/JAM build (`validate_block` needs more than the 8 KiB default).
 polkavm-derive = { workspace = true }
@@ -78,6 +81,7 @@ std = [
 	"codec/std",
 	"cumulus-pallet-parachain-system/std",
 	"log/std",
+	"pallet-bootnodes/std",
 	"pallet-jam-kv/std",
 	"pallet-parachain-template/std",
 	"polkadot-sdk/std",
@@ -90,12 +94,14 @@ spec-version-2 = []
 runtime-benchmarks = [
 	"cumulus-pallet-parachain-system/runtime-benchmarks",
 	"hex-literal",
+	"pallet-bootnodes/runtime-benchmarks",
 	"pallet-jam-kv/runtime-benchmarks",
 	"pallet-parachain-template/runtime-benchmarks",
 	"polkadot-sdk/runtime-benchmarks",
 ]
 try-runtime = [
 	"cumulus-pallet-parachain-system/try-runtime",
+	"pallet-bootnodes/try-runtime",
 	"pallet-jam-kv/try-runtime",
 	"pallet-parachain-template/try-runtime",
 	"polkadot-sdk/try-runtime",

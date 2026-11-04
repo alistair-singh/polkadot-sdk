@@ -5996,7 +5996,9 @@ dependencies = [
  "futures",
  "hex",
  "log",
+ "multiaddr",
  "multihash",
+ "pallet-bootnodes",
  "pallet-jam-kv",
  "parachain-service-core",
  "parity-scale-codec",
@@ -6007,6 +6009,7 @@ dependencies = [
  "sc-executor 0.32.0",
  "sc-executor-common 0.29.0",
  "sc-network-statement",
+ "sc-network-types 0.10.0",
  "sc-statement-store",
  "scale-info",
  "serde",
@@ -13027,6 +13030,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-bootnodes"
+version = "0.1.0"
+dependencies = [
+ "frame-benchmarking",
+ "frame-support",
+ "frame-system",
+ "multiaddr",
+ "parity-scale-codec",
+ "scale-info",
+ "serde",
+ "serde_json",
+ "sp-api 26.0.0",
+ "sp-core 28.0.0",
+ "sp-io 30.0.0",
+ "sp-keystore 0.34.0",
+ "sp-runtime 31.0.1",
+]
+
+[[package]]
+name = "pallet-bootnodes-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "array-bytes 6.2.2",
+ "clap",
+ "frame-metadata 23.0.1",
+ "jsonrpsee 0.24.11",
+ "multiaddr",
+ "pallet-bootnodes",
+ "parity-scale-codec",
+ "sc-network-types 0.10.0",
+ "serde",
+ "serde_json",
+ "sp-core 28.0.0",
+ "sp-crypto-hashing 0.1.0",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "pallet-bounties"
 version = "27.0.0"
 dependencies = [
@@ -15951,6 +15994,7 @@ dependencies = [
  "docify",
  "hex-literal",
  "log",
+ "pallet-bootnodes",
  "pallet-jam-kv",
  "pallet-parachain-template",
  "parity-scale-codec",
@@ -17679,6 +17723,8 @@ dependencies = [
  "jsonrpsee 0.24.11",
  "log",
  "nix 0.29.0",
+ "pallet-bootnodes",
+ "pallet-jam-kv",
  "pallet-transaction-payment",
  "pallet-transaction-payment-rpc",
  "pallet-transaction-payment-rpc-runtime-api",
@@ -18156,6 +18202,8 @@ dependencies = [
  "pallet-balances",
  "pallet-beefy",
  "pallet-beefy-mmr",
+ "pallet-bootnodes",
+ "pallet-bootnodes-cli",
  "pallet-bounties",
  "pallet-bridge-grandpa",
  "pallet-bridge-messages",

@@ -337,6 +337,20 @@ impl_runtime_apis! {
 		}
 	}
 
+	impl pallet_bootnodes::runtime_api::BootnodesApi<Block> for Runtime {
+		fn jam_genesis_hash() -> Option<sp_core::H256> {
+			// `pallet-bootnodes` is only part of the JAM build.
+			#[cfg(jam)]
+			{
+				pallet_bootnodes::JamGenesisHash::<Runtime>::get()
+			}
+			#[cfg(not(jam))]
+			{
+				None
+			}
+		}
+	}
+
 	impl cumulus_primitives_core::KeyToIncludeInRelayProof<Block> for Runtime {
 		fn keys_to_prove() -> cumulus_primitives_core::RelayProofRequest {
 			Default::default()
