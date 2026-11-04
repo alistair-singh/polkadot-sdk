@@ -62,6 +62,8 @@ pallet-jam-kv = { workspace = true, default-features = true, optional = true }
 # The bootnode entries and key the bootnodes test lists and reads back.
 pallet-bootnodes = { workspace = true, default-features = true, optional = true }
 multiaddr = { workspace = true, optional = true }
+# The peer id another para's node learns for a listed node key.
+sc-network-types = { workspace = true, default-features = true, optional = true }
 # The Parachain Service's own state-key derivation and proof verification.
 parachain-service-core = { path = "../../../../parachain-service/core", features = ["std"], optional = true }
 
@@ -77,4 +79,5 @@ jam = [
 	"dep:pallet-bootnodes",
 	"dep:pallet-jam-kv",
 	"dep:parachain-service-core",
+	"dep:sc-network-types",
 ]

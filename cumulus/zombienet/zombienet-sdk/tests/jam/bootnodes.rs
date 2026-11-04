@@ -22,6 +22,11 @@
 //! bootnodes with sudo, replaces one, removes both, and after each change waits for
 //! `serviceValue` on the Parachain Service to hold exactly the set the para now stores.
 //!
+//! A second test runs two paras. Para B's collator follows para A's set (`--jam-bootnodes-from`)
+//! and, once A lists its collator `alpha`, dials it. The two run different chains, so `alpha`
+//! refuses B's sync protocol; the connection itself is what shows B found A through JAM: B has
+//! no other way to learn `alpha`'s address, and the handshake checks the peer id.
+//!
 //! `pallet-bootnodes` does not check entries yet. The entries are signed under the runtime's
 //! placeholder JAM genesis hash, `H256::zero()`, so they stop verifying once the runtime uses the
 //! real hash; the test must then sign under that hash.
@@ -29,9 +34,9 @@
 use anyhow::Context;
 use codec::Encode;
 use cumulus_jam_zombienet_tests::{
-	network::wait_for_collators,
+	network::{free_port, wait_for_collators},
 	para::{Para, DEADLINE, PARACHAIN_SERVICE_ID, TINY_CORES},
-	spawn::{spawn, JamNetwork, SpawnOptions},
+	spawn::{spawn, CollatorOptions, JamNetwork, SpawnOptions},
 };
 use cumulus_zombienet_sdk_helpers::{
 	coretime::sudo_call, submit_extrinsic_and_wait_for_best_block_success,
@@ -39,7 +44,10 @@ use cumulus_zombienet_sdk_helpers::{
 use pallet_bootnodes::BOOTNODES_KEY;
 use pallet_jam_kv::kv_storage_key;
 use sp_core::{ed25519, Pair as _, H256};
-use std::time::{Duration, Instant};
+use std::{
+	collections::HashMap,
+	time::{Duration, Instant},
+};
 use zombienet_sdk::{
 	subxt::{dynamic::Value, tx::dynamic},
 	subxt_signer::sr25519::dev,
@@ -59,6 +67,9 @@ const FINALIZED: u64 = 2;
 
 /// Budget for a change to reach JAM: inclusion, refine, availability and accumulation.
 const KV_BUDGET: Duration = Duration::from_secs(4 * 60);
+
+/// Budget for a sudo call to land in a best block of the collator it was submitted to.
+const SUBMIT_BUDGET: Duration = Duration::from_secs(2 * 60);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bootnodes_are_published_to_jam() -> Result<(), anyhow::Error> {
@@ -95,6 +106,105 @@ async fn bootnodes_are_published_to_jam() -> Result<(), anyhow::Error> {
 
 	jam.destroy().await;
 	result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> {
+	let (a, b) = (Para::new(0, 0, &["alpha", "beta"]), Para::new(1, 1, &["gamma"]));
+	let alpha_port = free_port()?;
+	let mut options = SpawnOptions::new(TINY_CORES);
+	options.collators = HashMap::from([
+		("alpha".to_string(), CollatorOptions { p2p_port: Some(alpha_port), ..Default::default() }),
+		(
+			"gamma".to_string(),
+			CollatorOptions {
+				args: vec![
+					("--jam-bootnodes-from", a.id.to_string().as_str()).into(),
+					// The connection this test waits for is only logged at trace.
+					"-llitep2p::transport-manager=trace".into(),
+				],
+				..Default::default()
+			},
+		),
+	]);
+	let paras = [a.clone(), b];
+	let jam = spawn("another_para_dials_the_listed_bootnodes", &paras, options).await?;
+	let result = async {
+		wait_for_collators(&jam.network, &paras, BLOCKS, FINALIZED, DEADLINE.as_secs()).await?;
+		check_max_addr_len(&jam, &a).await?;
+		wait_for_log(&jam, "gamma", &["Following the para's bootnodes on JAM."]).await?;
+
+		// zombienet derives a node's network key from its name.
+		let alpha = ed25519::Pair::from_seed(&sp_crypto_hashing::sha2_256(b"alpha"));
+		let alpha_peer = peer_id(&alpha);
+		anyhow::ensure!(
+			connections_to(&jam, "gamma", &alpha_peer).await?.is_empty(),
+			"gamma reached alpha before para 0 listed it",
+		);
+
+		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
+		let entry = signed(&alpha, a.id, &format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws"));
+		add_bootnode(&jam, &a, &entry).await?;
+		wait_for_set(&jam, &kv_storage_key(a.id, BOOTNODES_KEY), &[&entry]).await?;
+		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &alpha_peer]).await?;
+		let connected = Instant::now();
+		while connections_to(&jam, "gamma", &alpha_peer).await?.is_empty() {
+			anyhow::ensure!(connected.elapsed() < DIAL_BUDGET, "gamma never connected to alpha");
+			tokio::time::sleep(Duration::from_secs(2)).await;
+		}
+		log::info!("gamma connected to alpha ({alpha_peer}) after {:?}", connected.elapsed());
+
+		remove_bootnode(&jam, &a, &alpha.public()).await?;
+		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &alpha_peer])
+			.await
+	}
+	.await;
+
+	jam.destroy().await;
+	result
+}
+
+/// How long a node may take to dial a peer it just learned: its peerset fills free slots every
+/// second or so.
+const DIAL_BUDGET: Duration = Duration::from_secs(60);
+
+/// The base58 peer id of the node whose network key is `pair`.
+fn peer_id(pair: &ed25519::Pair) -> String {
+	sc_network_types::PeerId::from_ed25519(&pair.public().0)
+		.expect("an ed25519 key is a peer id; qed")
+		.to_base58()
+}
+
+/// The lines of `name`'s log where litep2p established a connection with `peer`.
+async fn connections_to(jam: &JamNetwork, name: &str, peer: &str) -> anyhow::Result<Vec<String>> {
+	log_lines_with(jam, name, &["on connection established completed", peer]).await
+}
+
+/// The lines of `name`'s log that carry every one of `needles`.
+async fn log_lines_with(
+	jam: &JamNetwork,
+	name: &str,
+	needles: &[&str],
+) -> anyhow::Result<Vec<String>> {
+	let log = jam.network.get_node(name)?.logs().await?;
+	Ok(log
+		.lines()
+		.filter(|line| needles.iter().all(|needle| line.contains(needle)))
+		.map(str::to_string)
+		.collect())
+}
+
+/// Poll `name`'s log until a line carries every one of `needles`.
+async fn wait_for_log(jam: &JamNetwork, name: &str, needles: &[&str]) -> anyhow::Result<()> {
+	let started = Instant::now();
+	while log_lines_with(jam, name, needles).await?.is_empty() {
+		anyhow::ensure!(
+			started.elapsed() < KV_BUDGET,
+			"no line of {name}'s log carries {needles:?} after {KV_BUDGET:?}",
+		);
+		tokio::time::sleep(Duration::from_secs(2)).await;
+	}
+	Ok(())
 }
 
 fn node_key(seed: u8) -> ed25519::Pair {
@@ -154,12 +264,12 @@ async fn submit_bootnodes(
 ) -> anyhow::Result<()> {
 	let name = para.collators.first().context("the para has no collator")?;
 	let client = jam.collator_client(name).await?;
-	let block = submit_extrinsic_and_wait_for_best_block_success(
-		&client,
-		&sudo_call(dynamic("Bootnodes", call, fields)),
-		&dev::alice(),
-	)
-	.await?;
+	let (sudo, alice) = (sudo_call(dynamic("Bootnodes", call, fields)), dev::alice());
+	let submit = submit_extrinsic_and_wait_for_best_block_success(&client, &sudo, &alice);
+	// The helper waits forever for a block that never comes, e.g. when the collator stalls.
+	let block = tokio::time::timeout(SUBMIT_BUDGET, submit).await.map_err(|_| {
+		anyhow::anyhow!("Bootnodes::{call} not in a best block after {SUBMIT_BUDGET:?}")
+	})??;
 	log::info!("Bootnodes::{call} included in para block {block:?}");
 	Ok(())
 }
