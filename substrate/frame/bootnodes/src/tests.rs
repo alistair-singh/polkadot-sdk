@@ -310,17 +310,91 @@ fn genesis_bootnodes_need_the_jam_genesis_hash() {
 	.build_storage();
 }
 
-/// Step 3 restores the PoP check once its design settles on #13523.
 #[test]
-fn proof_of_possession_is_not_checked_yet() {
+fn add_bootnode_rejects_bad_proof_of_possession() {
 	new_test_ext().execute_with(|| {
-		let mut wrong_signer = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
-		wrong_signer.node_key = pair(2).public();
+		let good = signed(&pair(1), 3, "/ip4/1.2.3.4/tcp/30333");
 
-		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), wrong_signer));
-		assert_eq!(BootnodeSet::<Test>::get().len(), 1);
-		assert_ok!(Bootnodes::do_try_state());
+		// Signed by another key.
+		let mut bad = good.clone();
+		bad.node_key = pair(2).public();
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
+			Error::<Test>::InvalidSignature
+		);
+
+		// Signed over a different expiry slot.
+		let mut bad = good.clone();
+		bad.expiry_slot = 4;
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
+			Error::<Test>::InvalidSignature
+		);
+
+		// Signed over a different address.
+		let mut bad = good.clone();
+		bad.addr = addr("/ip4/1.2.3.5/tcp/30333");
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
+			Error::<Test>::InvalidSignature
+		);
+
+		// Signed for another para.
+		let mut bad = good.clone();
+		bad.sig = pair(1).sign(&crate::pop_payload(&JAM_GENESIS_HASH, PARA_ID + 1, &bad.addr, 3));
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
+			Error::<Test>::InvalidSignature
+		);
+
+		// Signed for another JAM chain.
+		let mut bad = good.clone();
+		bad.sig = pair(1).sign(&crate::pop_payload(&H256::zero(), PARA_ID, &bad.addr, 3));
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
+			Error::<Test>::InvalidSignature
+		);
+
+		// Signed without the domain separator.
+		let mut bad = good.clone();
+		bad.sig = pair(1).sign(&(JAM_GENESIS_HASH, PARA_ID, bad.addr.to_vec(), 3u32).encode());
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bad),
+			Error::<Test>::InvalidSignature
+		);
+
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), good));
 	});
+}
+
+/// An entry signed under the old JAM genesis hash is not accepted again once the hash changes.
+#[test]
+fn a_changed_jam_genesis_hash_rejects_entries_signed_under_the_old_one() {
+	new_test_ext().execute_with(|| {
+		let bootnode = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode.clone()));
+		assert_ok!(Bootnodes::set_jam_genesis_hash(RuntimeOrigin::root(), H256::repeat_byte(0x4b)));
+
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode),
+			Error::<Test>::InvalidSignature
+		);
+	});
+}
+
+#[test]
+#[should_panic(expected = "invalid bootnode in genesis config")]
+fn genesis_config_rejects_a_bad_proof_of_possession() {
+	let mut bootnode = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
+	bootnode.node_key = pair(2).public();
+	let _ = RuntimeGenesisConfig {
+		bootnodes: crate::GenesisConfig {
+			jam_genesis_hash: Some(JAM_GENESIS_HASH),
+			bootnodes: vec![bootnode],
+		},
+		..Default::default()
+	}
+	.build_storage();
 }
 
 #[test]

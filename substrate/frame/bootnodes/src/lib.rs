@@ -44,8 +44,9 @@
 //! listed until it is set. A reader on another para checks entries against its own para's value:
 //! both are on the same JAM.
 //!
-//! **Not enforced yet:** the pallet does not check the proof of possession, so readers must.
-//! The origin, the address shape and the set's capacity are enforced.
+//! The pallet enforces the origin, the JAM genesis hash being set, the address shape, the set's
+//! capacity and the proof of possession. Readers check the proof again, since root can write the
+//! published value past the pallet.
 //!
 //! The set can be seeded at genesis with entries signed ahead of time: `bootnodes-cli sign
 //! --offline` prints, as `bootnode`, an entry in the JSON form the genesis config takes.
@@ -291,8 +292,8 @@ pub mod pallet {
 		/// know it and sets it after launch with `set_jam_genesis_hash`.
 		pub jam_genesis_hash: Option<H256>,
 		/// Bootnodes listed from genesis. As with `add_bootnode`, the JAM genesis hash must be
-		/// set, and the address shape and the set's capacity are checked; an entry failing
-		/// any check fails the build. They are stored but not published.
+		/// set, and the address shape, the set's capacity and the proof of possession are
+		/// checked; an entry failing any check fails the build. They are stored but not published.
 		pub bootnodes: Vec<BootnodeOf<T>>,
 	}
 
@@ -358,8 +359,8 @@ pub mod pallet {
 	impl<T: Config> Pallet<T> {
 		/// Add a bootnode, or replace the entry of an already listed node key.
 		///
-		/// `bootnode.addr` must pass [`multiaddr::validate`]. `bootnode.sig` should be the node's
-		/// signature over [`pop_payload`]; that is not checked yet.
+		/// `bootnode.addr` must pass [`multiaddr::validate`] and `bootnode.sig` must be the node's
+		/// signature over [`Pallet::pop_payload`].
 		///
 		/// Emits `BootnodeAdded` for a new node key and `BootnodeUpdated` for a listed one.
 		#[pallet::call_index(0)]
@@ -413,8 +414,8 @@ impl<T: Config> Pallet<T> {
 		Self::add(bootnode, true)
 	}
 
-	/// Insert `bootnode` if the JAM genesis hash is set, its address is valid and the set has room;
-	/// publish the new set first if `publish`.
+	/// Insert `bootnode` if the JAM genesis hash is set, its address is valid, the set has room and
+	/// its proof of possession verifies; publish the new set first if `publish`.
 	fn add(bootnode: BootnodeOf<T>, publish: bool) -> DispatchResult {
 		ensure!(JamGenesisHash::<T>::exists(), Error::<T>::JamGenesisHashUnset);
 		multiaddr::validate(&bootnode.addr).map_err(|e| match e {
@@ -424,6 +425,7 @@ impl<T: Config> Pallet<T> {
 		let mut bootnodes = Bootnodes::<T>::get();
 		let position = bootnodes.iter().position(|b| b.node_key == bootnode.node_key);
 		ensure!(position.is_some() || !bootnodes.is_full(), Error::<T>::TooManyBootnodes);
+		ensure!(Self::verify_pop(&bootnode), Error::<T>::InvalidSignature);
 
 		let node_key = bootnode.node_key;
 		let addr = bootnode.addr.clone();
