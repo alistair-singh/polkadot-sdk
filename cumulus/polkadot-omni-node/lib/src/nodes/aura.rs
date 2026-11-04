@@ -731,6 +731,9 @@ where
 
 				for &other_para in &jam_params.bootnodes_from {
 					let network = bootnodes_network.clone();
+					// Proofs of possession are checked against this para's own JAM genesis hash:
+					// both paras are on the same JAM.
+					let own_client = client.clone();
 					spawn.spawn(
 						"jam-bootnodes",
 						Some("jam"),
@@ -738,6 +741,7 @@ where
 							jam.clone(),
 							jam_params.service_id,
 							other_para,
+							move || jam::bootnodes::own_jam_genesis_hash(&*own_client),
 							move |peer_id, addr| network.add_known_address(peer_id, addr),
 						)),
 					);

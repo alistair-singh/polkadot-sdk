@@ -24,12 +24,14 @@
 //! It follows JAM's finalized chain, so it never acts on a value that is later reverted. That
 //! only delays a change to the set by JAM's finality lag: connections already made stay up.
 //!
-//! The reader checks each entry's address the way `pallet-bootnodes` does
-//! ([`pallet_bootnodes::multiaddr::validate`]), since root on the other para can write the value
-//! without the pallet. It drops an entry once JAM's slot is past its `expiry_slot`, the consent
-//! lease the operator signed: the set is checked again on every finalized JAM block, not only when
-//! it changes, so an entry expires even if the other para never writes again. The proof of
-//! possession is not checked yet.
+//! The reader checks each entry the way `pallet-bootnodes` does, since root on the other para can
+//! write the value without the pallet: the address ([`pallet_bootnodes::multiaddr::validate`]),
+//! the lease and the proof of possession. The proof binds the JAM genesis hash, and the reader
+//! checks it against its own para's value, read through the `BootnodesApi` runtime API: both paras
+//! are on the same JAM. Without that value every entry is dropped. An entry is dropped once JAM's
+//! slot is past its `expiry_slot`, the consent lease the operator signed. The set is checked again
+//! on every finalized JAM block, not only when it changes, so an entry expires even if the other
+//! para never writes again, and the reader picks up its own para's hash once root sets it.
 
 use super::LOG_TARGET;
 use codec::Decode;
@@ -37,6 +39,7 @@ use futures::StreamExt;
 use jam_interface::{JamChainSource, JamStateSource, ServiceId, Slot};
 use pallet_bootnodes::BOOTNODES_KEY;
 use sc_network::{multiaddr::Protocol, Multiaddr, PeerId};
+use sp_core::{ed25519, Pair as _, H256};
 use std::sync::Arc;
 
 /// The address bound the reader decodes with. A runtime's own `MaxAddrLen` is smaller: the whole
@@ -46,26 +49,49 @@ type Bootnode = pallet_bootnodes::Bootnode<sp_core::ConstU32<4096>>;
 /// A listed node, as the network dials it.
 pub(crate) type KnownBootnode = (PeerId, Multiaddr);
 
-/// A dialable node and the last JAM slot its operator consented to being listed in.
-pub(crate) type Leased = (KnownBootnode, u32);
+/// The `BootnodesApi` method the reader calls on its own para.
+pub(crate) const JAM_GENESIS_HASH_API: &str = "BootnodesApi_jam_genesis_hash";
 
-/// The dialable nodes of a published set, with their leases; `None` is the empty set.
-pub(crate) fn dialable(value: Option<&[u8]>) -> Result<Vec<Leased>, codec::Error> {
+/// The entries of a published set; `None` is the empty set.
+pub(crate) fn decode(value: Option<&[u8]>) -> Result<Vec<Bootnode>, codec::Error> {
 	let Some(mut value) = value else { return Ok(Vec::new()) };
-	let set = Vec::<Bootnode>::decode(&mut value)?;
-	Ok(set
-		.iter()
-		.filter_map(|bootnode| Some((known_bootnode(bootnode)?, bootnode.expiry_slot)))
-		.collect())
+	Vec::<Bootnode>::decode(&mut value)
 }
 
-/// The nodes whose lease still holds at `now`: an entry counts up to and including its
-/// `expiry_slot`, the slot "after which readers drop the entry".
-pub(crate) fn unexpired(set: &[Leased], now: Slot) -> Vec<KnownBootnode> {
+/// The nodes of `para_id`'s `set` to dial at JAM slot `now`: the entries with a valid address, a
+/// lease that still holds and a proof of possession under `jam_genesis_hash`.
+pub(crate) fn dialable(
+	set: &[Bootnode],
+	para_id: u32,
+	jam_genesis_hash: &H256,
+	now: Slot,
+) -> Vec<KnownBootnode> {
 	set.iter()
-		.filter(|(_, expiry_slot)| now <= *expiry_slot)
-		.map(|(node, _)| node.clone())
+		.filter(|bootnode| holds_at(bootnode, now))
+		.filter(|bootnode| proves_possession(bootnode, para_id, jam_genesis_hash))
+		.filter_map(known_bootnode)
 		.collect()
+}
+
+/// Whether `bootnode`'s lease holds at `now`: an entry counts up to and including its
+/// `expiry_slot`, the slot "after which readers drop the entry".
+fn holds_at(bootnode: &Bootnode, now: Slot) -> bool {
+	now <= bootnode.expiry_slot
+}
+
+/// Whether `bootnode.sig` is its node's signature over the payload `pallet-bootnodes` defines.
+fn proves_possession(bootnode: &Bootnode, para_id: u32, jam_genesis_hash: &H256) -> bool {
+	let payload = pallet_bootnodes::pop_payload(
+		jam_genesis_hash,
+		para_id,
+		&bootnode.addr,
+		bootnode.expiry_slot,
+	);
+	let valid = ed25519::Pair::verify(&bootnode.sig, &payload, &bootnode.node_key);
+	if !valid {
+		tracing::debug!(target: LOG_TARGET, para_id, node_key = ?bootnode.node_key, "Skipping a bootnode: its proof of possession does not verify.");
+	}
+	valid
 }
 
 /// `addr/p2p/<peer id of node_key>`, or `None` for an entry the pallet would not have accepted
@@ -120,12 +146,17 @@ enum Event {
 /// Follow `para_id`'s published set at JAM's finalized block and pass every newly listed node to
 /// `add_known_address`. Returns when either subscription ends.
 ///
-/// A node that drops off the set, or whose lease expires, is only logged: the network has no
-/// way to forget an address.
+/// `own_jam_genesis_hash` reads this node's own para's JAM genesis hash, the value proofs of
+/// possession are checked against; it is called on every event, so a hash set after launch takes
+/// effect.
+///
+/// A node that drops off the set, whose lease expires or whose proof stops verifying is only
+/// logged: the network has no way to forget an address.
 pub(crate) async fn follow<Jam: JamStateSource + JamChainSource + ?Sized>(
 	jam: Arc<Jam>,
 	parachain_service: ServiceId,
 	para_id: u32,
+	own_jam_genesis_hash: impl Fn() -> Option<H256>,
 	add_known_address: impl Fn(PeerId, Multiaddr),
 ) {
 	let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
@@ -144,6 +175,7 @@ pub(crate) async fn follow<Jam: JamStateSource + JamChainSource + ?Sized>(
 	let (mut values, mut blocks) = (values.fuse(), blocks.fuse());
 
 	let (mut set, mut now, mut listed) = (Vec::new(), 0, Listed::default());
+	let mut had_hash = true;
 	loop {
 		// Either stream ending ends the reader: without values there is nothing to follow, and
 		// without blocks no lease could expire.
@@ -155,8 +187,8 @@ pub(crate) async fn follow<Jam: JamStateSource + JamChainSource + ?Sized>(
 		match event {
 			Event::Value(update) => {
 				now = now.max(update.slot);
-				match dialable(update.value.as_deref()) {
-					Ok(dialable) => set = dialable,
+				match decode(update.value.as_deref()) {
+					Ok(decoded) => set = decoded,
 					Err(error) => {
 						tracing::warn!(target: LOG_TARGET, para_id, at = ?update.header_hash, ?error, "The para's bootnode set does not decode; keeping the nodes listed before.");
 						continue;
@@ -165,48 +197,111 @@ pub(crate) async fn follow<Jam: JamStateSource + JamChainSource + ?Sized>(
 			},
 			Event::Block(block) => now = now.max(block.slot),
 		}
-		let Change { added, removed } = listed.update(unexpired(&set, now));
+		let jam_genesis_hash = own_jam_genesis_hash();
+		if jam_genesis_hash.is_some() != had_hash {
+			had_hash = jam_genesis_hash.is_some();
+			if had_hash {
+				tracing::info!(target: LOG_TARGET, para_id, "This para's JAM genesis hash is set; checking the para's bootnodes against it.");
+			} else {
+				tracing::warn!(target: LOG_TARGET, para_id, "This para has no JAM genesis hash to check proofs of possession against; dropping every bootnode of the para.");
+			}
+		}
+		let current = jam_genesis_hash
+			.map(|hash| dialable(&set, para_id, &hash, now))
+			.unwrap_or_default();
+		let Change { added, removed } = listed.update(current);
 		for (peer_id, addr) in added {
 			tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "Learned a bootnode of para {para_id}.");
 			add_known_address(peer_id, addr);
 		}
 		for node in removed {
 			let (peer_id, addr) = &node;
-			if set.iter().any(|(listed, _)| *listed == node) {
-				tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} expired.");
-			} else {
-				tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} is no longer listed.");
+			let still_listed =
+				set.iter().find(|bootnode| known_bootnode(bootnode).as_ref() == Some(&node));
+			match still_listed {
+				None => {
+					tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} is no longer listed.")
+				},
+				Some(bootnode) if !holds_at(bootnode, now) => {
+					tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} expired.")
+				},
+				Some(_) => {
+					tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = now, "A bootnode of para {para_id} no longer proves possession.")
+				},
 			}
 		}
 	}
 	tracing::warn!(target: LOG_TARGET, para_id, "The subscription to the para's bootnodes ended.");
 }
 
+/// This node's own para's JAM genesis hash, from `BootnodesApi` at its finalized block. `None`
+/// when the runtime has no such API or no hash set.
+pub(crate) fn own_jam_genesis_hash<Block, Client>(client: &Client) -> Option<H256>
+where
+	Block: sp_runtime::traits::Block,
+	Client: sc_client_api::ExecutorProvider<Block> + sp_blockchain::HeaderBackend<Block>,
+{
+	use sc_client_api::CallExecutor as _;
+	let at = client.info().finalized_hash;
+	let call = client.executor().call(
+		at,
+		JAM_GENESIS_HASH_API,
+		&[],
+		sp_core::traits::CallContext::Offchain,
+	);
+	match call {
+		Ok(raw) => Option::<H256>::decode(&mut &raw[..]).ok().flatten(),
+		Err(error) => {
+			tracing::trace!(target: LOG_TARGET, ?error, "This para's runtime has no {JAM_GENESIS_HASH_API}.");
+			None
+		},
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use codec::Encode;
-	use sp_core::{ed25519, Pair as _};
 
-	fn entry(seed: u8, addr: &str) -> Bootnode {
-		let pair = ed25519::Pair::from_seed(&[seed; 32]);
-		let addr: Multiaddr = addr.parse().expect("the test's addresses parse; qed");
+	/// The JAM genesis hash and source para the tests sign for.
+	const HASH: H256 = H256::repeat_byte(0x4a);
+	const PARA: u32 = 0;
+
+	fn pair(seed: u8) -> ed25519::Pair {
+		ed25519::Pair::from_seed(&[seed; 32])
+	}
+
+	/// An entry for `seed`'s key over the raw `addr`, with a valid proof of possession for [`PARA`]
+	/// under [`HASH`].
+	fn signed_raw(seed: u8, addr: Vec<u8>, expiry_slot: u32) -> Bootnode {
+		let addr: sp_runtime::BoundedVec<u8, sp_core::ConstU32<4096>> =
+			addr.try_into().expect("the test's addresses are short; qed");
+		let payload = pallet_bootnodes::pop_payload(&HASH, PARA, &addr, expiry_slot);
 		Bootnode {
-			addr: addr.to_vec().try_into().expect("the test's addresses are short; qed"),
-			node_key: pair.public(),
-			expiry_slot: 0,
-			sig: ed25519::Signature::from_raw([0; 64]),
+			addr,
+			node_key: pair(seed).public(),
+			expiry_slot,
+			sig: pair(seed).sign(&payload),
 		}
 	}
 
-	fn peer(seed: u8) -> PeerId {
-		let public = ed25519::Pair::from_seed(&[seed; 32]).public();
-		PeerId::from_ed25519(&public.0).expect("an ed25519 key is a peer id; qed")
+	fn entry_until(seed: u8, addr: &str, expiry_slot: u32) -> Bootnode {
+		let addr: Multiaddr = addr.parse().expect("the test's addresses parse; qed");
+		signed_raw(seed, addr.to_vec(), expiry_slot)
 	}
 
-	/// The dialable nodes of `value`, leases aside.
+	/// A signed entry whose lease never ends.
+	fn entry(seed: u8, addr: &str) -> Bootnode {
+		entry_until(seed, addr, u32::MAX)
+	}
+
+	fn peer(seed: u8) -> PeerId {
+		PeerId::from_ed25519(&pair(seed).public().0).expect("an ed25519 key is a peer id; qed")
+	}
+
+	/// The nodes of `value` to dial at slot 0, for [`PARA`] under [`HASH`].
 	fn nodes(value: Option<&[u8]>) -> Result<Vec<KnownBootnode>, codec::Error> {
-		dialable(value).map(|set| set.into_iter().map(|(node, _)| node).collect())
+		decode(value).map(|set| dialable(&set, PARA, &HASH, 0))
 	}
 
 	fn known(seed: u8, addr: &str) -> KnownBootnode {
@@ -231,55 +326,71 @@ mod tests {
 
 	#[test]
 	fn a_value_that_is_no_set_is_an_error() {
-		assert!(nodes(Some(&[0x04, 0xff])).is_err());
+		assert!(decode(Some(&[0x04, 0xff])).is_err());
 	}
 
 	/// Root on the other para can write any set, so the reader skips every address the pallet
-	/// would have rejected and keeps the rest. An address naming its own peer id would be
-	/// dialed as someone else.
+	/// would have rejected and keeps the rest. Each entry's proof is valid, over its own bytes.
+	/// An address naming its own peer id would be dialed as someone else.
 	#[test]
 	fn entries_the_pallet_would_reject_are_skipped() {
-		let mut garbage = entry(1, "/ip4/127.0.0.1/tcp/1");
-		garbage.addr = vec![0xff, 0xff].try_into().expect("short; qed");
+		let address = |addr: &str| addr.parse::<Multiaddr>().expect("valid; qed").to_vec();
+		let garbage = signed_raw(1, vec![0xff, 0xff], u32::MAX);
 		let with_peer_id = entry(2, &format!("/ip4/127.0.0.1/tcp/2/p2p/{}", peer(9)));
 		let udp = entry(3, "/ip4/127.0.0.1/udp/3/quic-v1");
 		let memory = entry(4, "/memory/4");
 		// `/ip4/127.0.0.1/tcp/5` with the ip4 code as a non-minimal varint.
-		let mut non_canonical = entry(5, "/ip4/127.0.0.1/tcp/5");
-		non_canonical.addr = [&[0x84, 0x00][..], &non_canonical.addr[1..]]
-			.concat()
-			.try_into()
-			.expect("short; qed");
+		let non_canonical = address("/ip4/127.0.0.1/tcp/5");
+		let non_canonical =
+			signed_raw(5, [&[0x84, 0x00][..], &non_canonical[1..]].concat(), u32::MAX);
 		let fine = entry(6, "/ip4/127.0.0.1/tcp/6");
 		let set = vec![garbage, with_peer_id, udp, memory, non_canonical, fine];
 
 		assert_eq!(nodes(Some(&set.encode())), Ok(vec![known(6, "/ip4/127.0.0.1/tcp/6")]));
 	}
 
+	/// The proof must be the node's own signature, for the source para, under this para's JAM
+	/// genesis hash, with the domain separator.
 	#[test]
-	fn every_entry_keeps_its_lease() {
-		let (mut a, mut b) = (entry(1, "/ip4/127.0.0.1/tcp/1"), entry(2, "/ip4/127.0.0.1/tcp/2"));
-		(a.expiry_slot, b.expiry_slot) = (7, u32::MAX);
+	fn entries_without_a_valid_proof_of_possession_are_skipped() {
+		let good = entry(1, "/ip4/127.0.0.1/tcp/1");
+		let sign = |payload: &[u8]| pair(2).sign(payload);
+		let pop = |hash: &H256, para: u32| {
+			pallet_bootnodes::pop_payload(hash, para, &good.addr, good.expiry_slot)
+		};
 
-		assert_eq!(
-			dialable(Some(&vec![a, b].encode())),
-			Ok(vec![
-				(known(1, "/ip4/127.0.0.1/tcp/1"), 7),
-				(known(2, "/ip4/127.0.0.1/tcp/2"), u32::MAX)
-			]),
-		);
+		let mut another_key = entry(2, "/ip4/127.0.0.1/tcp/2");
+		another_key.sig = pair(3).sign(&pop(&HASH, PARA));
+		let mut another_para = entry(2, "/ip4/127.0.0.1/tcp/2");
+		another_para.sig =
+			sign(&pallet_bootnodes::pop_payload(&HASH, PARA + 1, &another_para.addr, u32::MAX));
+		let mut another_chain = entry(2, "/ip4/127.0.0.1/tcp/2");
+		another_chain.sig = sign(&pallet_bootnodes::pop_payload(
+			&H256::zero(),
+			PARA,
+			&another_chain.addr,
+			u32::MAX,
+		));
+		let mut no_domain = entry(2, "/ip4/127.0.0.1/tcp/2");
+		no_domain.sig = sign(&(HASH, PARA, no_domain.addr.to_vec(), u32::MAX).encode());
+
+		for bad in [another_key, another_para, another_chain, no_domain] {
+			let set = vec![bad, good.clone()];
+			assert_eq!(nodes(Some(&set.encode())), Ok(vec![known(1, "/ip4/127.0.0.1/tcp/1")]));
+		}
 	}
 
 	/// An entry counts up to and including its `expiry_slot`; `u32::MAX` never expires.
 	#[test]
 	fn a_lease_holds_through_its_expiry_slot() {
+		let set = vec![entry_until(1, "/ip4/127.0.0.1/tcp/1", 7), entry(2, "/ip4/127.0.0.1/tcp/2")];
 		let (a, forever) = (known(1, "/ip4/127.0.0.1/tcp/1"), known(2, "/ip4/127.0.0.1/tcp/2"));
-		let set = vec![(a.clone(), 7), (forever.clone(), u32::MAX)];
+		let at = |now| dialable(&set, PARA, &HASH, now);
 
-		assert_eq!(unexpired(&set, 0), vec![a.clone(), forever.clone()]);
-		assert_eq!(unexpired(&set, 7), vec![a, forever.clone()]);
-		assert_eq!(unexpired(&set, 8), vec![forever.clone()]);
-		assert_eq!(unexpired(&set, u32::MAX), vec![forever]);
+		assert_eq!(at(0), vec![a.clone(), forever.clone()]);
+		assert_eq!(at(7), vec![a, forever.clone()]);
+		assert_eq!(at(8), vec![forever.clone()]);
+		assert_eq!(at(u32::MAX), vec![forever]);
 	}
 
 	/// A JAM source with scripted value updates. It records whether the reader asked for the
@@ -412,11 +523,22 @@ mod tests {
 		}
 	}
 
-	/// Run the reader over `jam`'s scripted updates; the nodes it handed to the network, in order.
-	async fn learned(jam: Arc<ScriptedJam>) -> Vec<KnownBootnode> {
+	/// Run the reader over `jam`'s scripted updates, with this para's hash from `own_hash`; the
+	/// nodes it handed to the network, in order.
+	async fn learned_with(
+		jam: Arc<ScriptedJam>,
+		own_hash: impl Fn() -> Option<H256>,
+	) -> Vec<KnownBootnode> {
 		let learned = std::sync::Mutex::new(Vec::new());
-		follow(jam, 1337, 0, |peer_id, addr| learned.lock().unwrap().push((peer_id, addr))).await;
+		follow(jam, 1337, PARA, own_hash, |peer_id, addr| {
+			learned.lock().unwrap().push((peer_id, addr))
+		})
+		.await;
 		learned.into_inner().unwrap()
+	}
+
+	async fn learned(jam: Arc<ScriptedJam>) -> Vec<KnownBootnode> {
+		learned_with(jam, || Some(HASH)).await
 	}
 
 	/// A value that is later reverted must never be dialed, so the reader subscribes to the
@@ -445,6 +567,23 @@ mod tests {
 			learned(jam).await,
 			vec![known(1, "/ip4/127.0.0.1/tcp/1"), known(2, "/ip4/127.0.0.1/tcp/2")],
 		);
+	}
+
+	/// Without its own para's JAM genesis hash the reader cannot check a proof, so it dials
+	/// nothing; once root sets the hash, the same set is checked against it.
+	#[tokio::test]
+	async fn the_reader_needs_its_own_jam_genesis_hash() {
+		let set = Some(vec![entry(1, "/ip4/127.0.0.1/tcp/1")].encode());
+		assert_eq!(learned_with(ScriptedJam::with_values([set.clone()]), || None).await, vec![]);
+
+		// The hash is set between the first and the second update of an unchanged set.
+		let calls = std::sync::atomic::AtomicUsize::new(0);
+		let own_hash = || {
+			let call = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			(call > 0).then_some(HASH)
+		};
+		let jam = ScriptedJam::with_values([set.clone(), set]);
+		assert_eq!(learned_with(jam, own_hash).await, vec![known(1, "/ip4/127.0.0.1/tcp/1")]);
 	}
 
 	/// The reader hands each node to the network once, and names the ones that left the set.

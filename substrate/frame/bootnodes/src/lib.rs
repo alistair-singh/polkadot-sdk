@@ -76,6 +76,7 @@ mod benchmarking;
 #[cfg(test)]
 mod mock;
 pub mod multiaddr;
+pub mod runtime_api;
 #[cfg(test)]
 mod tests;
 pub mod weights;

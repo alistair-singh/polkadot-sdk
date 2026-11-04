@@ -28,14 +28,14 @@
 //! no other way to learn `alpha`'s address, and the handshake checks the peer id. `alpha` is
 //! listed at a dead port first and then moved, so the connection also shows the reader follows a
 //! replaced entry. Root on A then writes a set past the pallet with `JamKv::set_kv`, and B dials
-//! only the entries the pallet would have accepted and whose lease holds: an entry that expired
-//! before it was written is never learned, and `beta`'s short lease expires on B without A
-//! writing again.
+//! only the entries the pallet would have accepted, whose node signed them and whose lease holds:
+//! an entry that expired before it was written is never learned, nor one signed by another key,
+//! and `beta`'s short lease expires on B without A writing again.
 //!
 //! JAM's genesis embeds each para's genesis head, so no para can carry the JAM genesis hash in its
 //! genesis. Each test first sets it with sudo on every para, from the genesis header in the JAM
-//! chain spec, checked against JAM itself; entries are signed under it. `pallet-bootnodes` does
-//! not check the proof of possession yet.
+//! chain spec, checked against JAM itself; entries are signed under it. Para B's reader checks
+//! A's entries against B's own hash.
 
 use anyhow::Context;
 use codec::Encode;
@@ -178,20 +178,28 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 			.await?;
 
 		// Root writes the set past the pallet: an entry the pallet would reject, one whose lease
-		// is already over, and `beta` with a lease of `BETA_LEASE` slots.
-		let (rejected_key, expired_key) = (node_key(9), node_key(8));
+		// is already over, one whose node never signed it, and `beta` with a lease of
+		// `BETA_LEASE` slots.
+		let (rejected_key, expired_key, forged_key) = (node_key(9), node_key(8), node_key(7));
 		let rejected = signer.entry(&rejected_key, "/ip4/127.0.0.1/udp/30333/quic-v1");
 		let expired = signer.until(&expired_key, "/ip4/127.0.0.1/tcp/1/ws", 1);
+		// Signed by another key: root lists a node that did not consent.
+		let mut forged = signer.entry(&forged_key, "/ip4/127.0.0.1/tcp/2/ws");
+		forged.sig = signer.entry(&node_key(6), "/ip4/127.0.0.1/tcp/2/ws").sig;
 		let beta_expiry = u32::try_from(jam.jam_rpc.finalized_slot().await?)? + BETA_LEASE;
 		let beta_addr = format!("/ip4/127.0.0.1/tcp/{beta_port}/ws");
 		let beta_entry = signer.until(&beta, &beta_addr, beta_expiry);
 		// A `Vec`, not an array: SCALE gives arrays no length prefix.
-		let set = vec![&rejected, &expired, &beta_entry];
+		let set = vec![&rejected, &expired, &forged, &beta_entry];
 		set_kv(&jam, &a, BOOTNODES_KEY, &set.encode()).await?;
 		wait_for_set(&jam, &key, &set).await?;
 		// All entries come from one update, so once `beta` is learned the others were skipped.
 		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
-		let skipped = [(&rejected_key, "the pallet would reject"), (&expired_key, "had expired")];
+		let skipped = [
+			(&rejected_key, "the pallet would reject"),
+			(&expired_key, "had expired"),
+			(&forged_key, "its node never signed"),
+		];
 		for (node, why) in skipped {
 			let peer = peer_id(node);
 			let learned = log_lines_with(&jam, "gamma", &["Learned a bootnode", &peer]).await?;
