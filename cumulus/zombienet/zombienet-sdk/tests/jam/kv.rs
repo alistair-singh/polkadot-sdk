@@ -35,7 +35,7 @@ use cumulus_jam_zombienet_tests::{
 	spawn::{spawn, JamNetwork, SpawnOptions},
 };
 use cumulus_zombienet_sdk_helpers::{
-	coretime::sudo_call, submit_extrinsic_and_wait_for_best_block_success,
+	coretime::sudo_call, submit_extrinsic_and_wait_for_best_block_success, PARA_BLOCK_METRIC,
 };
 use pallet_jam_kv::kv_storage_key;
 use std::time::{Duration, Instant};
@@ -53,6 +53,9 @@ const FINALIZED: u64 = 2;
 
 /// Budget for a write to reach JAM: inclusion, refine, availability and accumulation.
 const KV_BUDGET: Duration = Duration::from_secs(4 * 60);
+
+/// Budget for a sudo call to land in a best block of the collator it was submitted to.
+const SUBMIT_BUDGET: Duration = Duration::from_secs(2 * 60);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_round_trip_works() -> Result<(), anyhow::Error> {
@@ -90,6 +93,64 @@ async fn kv_round_trip_works() -> Result<(), anyhow::Error> {
 	result
 }
 
+/// A block that writes to the KV store imports on every collator, not only on its author: each
+/// collator re-executes the others' blocks, so a write that only works while authoring forks the
+/// para at the first block carrying one.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_writes_import_on_every_collator() -> Result<(), anyhow::Error> {
+	let para = Para::single(2);
+	let paras = std::slice::from_ref(&para);
+	let jam =
+		spawn("kv_writes_import_on_every_collator", paras, SpawnOptions::new(TINY_CORES)).await?;
+	let result = async {
+		wait_for_collators(&jam.network, paras, BLOCKS, FINALIZED, DEADLINE.as_secs()).await?;
+		let key = kv_storage_key(para.id, KEY);
+
+		submit_jam_kv(
+			&jam,
+			&para,
+			"set_kv",
+			vec![Value::from_bytes(KEY), Value::from_bytes(VALUE)],
+		)
+		.await?;
+		wait_for_value(&jam, &key, Some(VALUE)).await?;
+
+		let name = para.collators.first().context("the para has no collator")?;
+		let written_at = jam.network.get_node(name.as_str())?.reports(PARA_BLOCK_METRIC).await?;
+		let past = written_at + IMPORTED_PAST as f64;
+		for name in &para.collators {
+			let node = jam.network.get_node(name.as_str())?;
+			node.wait_metric_with_timeout(
+				PARA_BLOCK_METRIC,
+				|best| best >= past,
+				KV_BUDGET.as_secs(),
+			)
+			.await
+			.map_err(|error| {
+				anyhow::anyhow!(
+					"{name} stopped below #{past} after the write at #{written_at}: {error}"
+				)
+			})?;
+			let failed: Vec<String> = node
+				.logs()
+				.await?
+				.lines()
+				.filter(|line| line.contains("Error importing block"))
+				.map(str::to_string)
+				.collect();
+			anyhow::ensure!(failed.is_empty(), "{name} failed to import: {failed:#?}");
+		}
+		Ok(())
+	}
+	.await;
+
+	jam.destroy().await;
+	result
+}
+
+/// How many blocks past the one carrying the write every collator must import.
+const IMPORTED_PAST: u64 = 3;
+
 /// Submit `JamKv::<call>(fields)` as sudo through the para's first collator.
 async fn submit_jam_kv(
 	jam: &JamNetwork,
@@ -99,12 +160,12 @@ async fn submit_jam_kv(
 ) -> anyhow::Result<()> {
 	let name = para.collators.first().context("the para has no collator")?;
 	let client = jam.collator_client(name).await?;
-	let block = submit_extrinsic_and_wait_for_best_block_success(
-		&client,
-		&sudo_call(dynamic("JamKv", call, fields)),
-		&dev::alice(),
-	)
-	.await?;
+	let (sudo, alice) = (sudo_call(dynamic("JamKv", call, fields)), dev::alice());
+	let submit = submit_extrinsic_and_wait_for_best_block_success(&client, &sudo, &alice);
+	// The helper waits forever for a block that never comes, e.g. when the collator stalls.
+	let block = tokio::time::timeout(SUBMIT_BUDGET, submit).await.map_err(|_| {
+		anyhow::anyhow!("JamKv::{call} not in a best block after {SUBMIT_BUDGET:?}")
+	})??;
 	log::info!("JamKv::{call} included in para block {block:?}");
 	Ok(())
 }
