@@ -196,6 +196,18 @@ fn genesis_config_rejects_invalid_multiaddr() {
 	.build_storage();
 }
 
+/// The pallet stores the lease without comparing it against JAM time: readers drop an entry once
+/// JAM's slot is past `expiry_slot`, including one that had expired before it was added.
+#[test]
+fn an_already_expired_entry_is_accepted() {
+	new_test_ext().execute_with(|| {
+		let expired = signed(&pair(1), 0, "/ip4/1.2.3.4/tcp/30333");
+
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), expired.clone()));
+		assert_eq!(BootnodeSet::<Test>::get().to_vec(), vec![expired]);
+	});
+}
+
 /// Step 3 restores the PoP check once its design settles on #13523.
 #[test]
 fn proof_of_possession_is_not_checked_yet() {
