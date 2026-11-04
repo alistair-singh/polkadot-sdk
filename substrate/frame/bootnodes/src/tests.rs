@@ -147,23 +147,64 @@ fn add_bootnode_requires_admin_origin() {
 }
 
 #[test]
-fn entries_are_stored_without_validation() {
+fn add_bootnode_rejects_invalid_multiaddr() {
 	new_test_ext().execute_with(|| {
-		let good = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
-
-		// Not a multiaddr at all.
-		let mut garbage = good.clone();
-		garbage.addr = vec![4, 1, 2, 3].try_into().unwrap();
-		// A `/p2p/` component, with the signature over that address.
-		let with_peer_id = signed(&pair(2), EXPIRY, &format!("/ip4/1.2.3.4/tcp/30333/p2p/{PEER}"));
-		// Signed by another key.
-		let mut wrong_signer = good.clone();
-		wrong_signer.node_key = pair(3).public();
-
-		for bootnode in [garbage, with_peer_id, wrong_signer] {
-			assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode));
+		let pair = pair(1);
+		for bad in [
+			// Empty, truncated, and not a multiaddr at all.
+			vec![],
+			vec![4, 1, 2, 3],
+			vec![0xff, 0xff, 0xff, 0xff, 0x7f],
+			// `/ip4/1.2.3.4/tcp/30333` with the ip4 code as a non-minimal varint.
+			[&[0x84, 0x00][..], &addr("/ip4/1.2.3.4/tcp/30333")[1..]].concat(),
+			// A DNS name that is not UTF-8.
+			[&[54, 2, 0xff, 0xfe][..], &addr("/ip4/1.2.3.4/tcp/30333")[5..]].concat(),
+			// A transport a bootnode cannot be dialed on, and no transport.
+			addr("/ip4/1.2.3.4/udp/30333/quic-v1").to_vec(),
+			addr("/ip4/1.2.3.4").to_vec(),
+		] {
+			let addr: BoundedVec<u8, _> = bad.try_into().unwrap();
+			let sig = pair.sign(&Bootnodes::pop_payload(&addr, EXPIRY));
+			let bootnode = Bootnode { addr, node_key: pair.public(), expiry_slot: EXPIRY, sig };
+			assert_noop!(
+				Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode),
+				Error::<Test>::InvalidMultiaddr
+			);
 		}
-		assert_eq!(BootnodeSet::<Test>::get().len(), 3);
+	});
+}
+
+#[test]
+fn add_bootnode_rejects_multiaddr_with_peer_id() {
+	new_test_ext().execute_with(|| {
+		let bootnode = signed(&pair(1), EXPIRY, &format!("/ip4/1.2.3.4/tcp/30333/p2p/{PEER}"));
+		assert_noop!(
+			Bootnodes::add_bootnode(RuntimeOrigin::root(), bootnode),
+			Error::<Test>::MultiaddrContainsPeerId
+		);
+	});
+}
+
+#[test]
+#[should_panic(expected = "invalid bootnode in genesis config")]
+fn genesis_config_rejects_invalid_multiaddr() {
+	let bootnode = signed(&pair(1), EXPIRY, &format!("/ip4/1.2.3.4/tcp/30333/p2p/{PEER}"));
+	let _ = RuntimeGenesisConfig {
+		bootnodes: crate::GenesisConfig { bootnodes: vec![bootnode] },
+		..Default::default()
+	}
+	.build_storage();
+}
+
+/// Step 3 restores the PoP check once its design settles on #13523.
+#[test]
+fn proof_of_possession_is_not_checked_yet() {
+	new_test_ext().execute_with(|| {
+		let mut wrong_signer = signed(&pair(1), EXPIRY, "/ip4/1.2.3.4/tcp/30333");
+		wrong_signer.node_key = pair(2).public();
+
+		assert_ok!(Bootnodes::add_bootnode(RuntimeOrigin::root(), wrong_signer));
+		assert_eq!(BootnodeSet::<Test>::get().len(), 1);
 		assert_ok!(Bootnodes::do_try_state());
 	});
 }
@@ -296,6 +337,12 @@ fn try_state_detects_broken_invariants() {
 
 		let entry = BootnodeSet::<Test>::get()[0].clone();
 		BootnodeSet::<Test>::mutate(|set| set.try_push(entry).unwrap());
+		assert!(Bootnodes::do_try_state().is_err());
+
+		BootnodeSet::<Test>::mutate(|set| {
+			set.truncate(1);
+			set[0].addr = vec![4, 1, 2, 3].try_into().unwrap();
+		});
 		assert!(Bootnodes::do_try_state().is_err());
 	});
 }
