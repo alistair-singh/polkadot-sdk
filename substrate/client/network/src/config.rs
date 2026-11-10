@@ -48,6 +48,7 @@ use sc_network_types::{
 use crate::service::{ensure_addresses_consistent_with_transport, traits::NetworkBackend};
 use codec::Encode;
 use prometheus_endpoint::Registry;
+use sc_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnboundedSender};
 use zeroize::Zeroize;
 
 pub use sc_network_common::{
@@ -825,6 +826,47 @@ pub struct Params<Block: BlockT, H: ExHashT, N: NetworkBackend<Block, H>> {
 	pub notification_metrics: NotificationMetrics,
 }
 
+/// Opens client-mode Kademlia instances on the DHTs of other chains while the network runs.
+///
+/// An instance does not answer queries and is not advertised.
+#[derive(Clone)]
+pub struct ClientKademlia {
+	tx: TracingUnboundedSender<ClientKademliaRequest>,
+}
+
+/// A request to [`ClientKademlia`].
+pub(crate) struct ClientKademliaRequest {
+	/// The instance to register.
+	pub(crate) config: litep2p::protocol::libp2p::kademlia::Config,
+	/// Its handle, sent back through `reply` once the instance runs.
+	pub(crate) handle: Litep2pKademliaHandle,
+	pub(crate) reply: futures::channel::oneshot::Sender<Litep2pKademliaHandle>,
+}
+
+impl ClientKademlia {
+	/// Open an instance on the DHT of the chain with `genesis_hash` and `fork_id`.
+	///
+	/// `None` if the network has stopped, or already runs an instance on that DHT.
+	pub async fn open(
+		&self,
+		genesis_hash: &[u8],
+		fork_id: Option<&str>,
+	) -> Option<Litep2pKademliaHandle> {
+		use litep2p::protocol::libp2p::kademlia::{ConfigBuilder, KademliaMode};
+
+		let (config, handle) = ConfigBuilder::new()
+			.with_protocol_names(vec![crate::litep2p::discovery::kademlia_protocol_name(
+				genesis_hash,
+				fork_id,
+			)])
+			.with_mode(KademliaMode::Client)
+			.build();
+		let (reply, handle_rx) = futures::channel::oneshot::channel();
+		self.tx.unbounded_send(ClientKademliaRequest { config, handle, reply }).ok()?;
+		handle_rx.await.ok()
+	}
+}
+
 /// Full network configuration.
 pub struct FullNetworkConfiguration<B: BlockT + 'static, H: ExHashT, N: NetworkBackend<B, H>> {
 	/// Installed notification protocols.
@@ -833,8 +875,10 @@ pub struct FullNetworkConfiguration<B: BlockT + 'static, H: ExHashT, N: NetworkB
 	/// List of request-response protocols that the node supports.
 	pub(crate) request_response_protocols: Vec<N::RequestResponseProtocolConfig>,
 
-	/// Client-mode Kademlia instances on the DHTs of other chains.
-	pub(crate) client_kademlia: Vec<litep2p::protocol::libp2p::kademlia::Config>,
+	/// Opens client-mode Kademlia instances on the DHTs of other chains, and the requests the
+	/// backend serves.
+	pub(crate) client_kademlia:
+		Option<(ClientKademlia, TracingUnboundedReceiver<ClientKademliaRequest>)>,
 
 	/// Network configuration.
 	pub network_config: NetworkConfiguration,
@@ -861,7 +905,7 @@ impl<B: BlockT + 'static, H: ExHashT, N: NetworkBackend<B, H>> FullNetworkConfig
 			peer_store_handle,
 			notification_protocols: Vec::new(),
 			request_response_protocols: Vec::new(),
-			client_kademlia: Vec::new(),
+			client_kademlia: None,
 			network_config: network_config.clone(),
 			metrics_registry,
 		}
@@ -882,26 +926,18 @@ impl<B: BlockT + 'static, H: ExHashT, N: NetworkBackend<B, H>> FullNetworkConfig
 		self.request_response_protocols.push(config);
 	}
 
-	/// Add a client-mode Kademlia instance on the DHT of the chain with `genesis_hash` and
-	/// `fork_id`. It does not answer queries and is not advertised.
+	/// A handle that opens client-mode Kademlia instances on the DHTs of other chains while the
+	/// network runs.
 	///
-	/// Only `Litep2pNetworkBackend` starts these instances.
-	pub fn add_client_kademlia(
-		&mut self,
-		genesis_hash: &[u8],
-		fork_id: Option<&str>,
-	) -> Litep2pKademliaHandle {
-		use litep2p::protocol::libp2p::kademlia::{ConfigBuilder, KademliaMode};
-
-		let (config, handle) = ConfigBuilder::new()
-			.with_protocol_names(vec![crate::litep2p::discovery::kademlia_protocol_name(
-				genesis_hash,
-				fork_id,
-			)])
-			.with_mode(KademliaMode::Client)
-			.build();
-		self.client_kademlia.push(config);
-		handle
+	/// Only `Litep2pNetworkBackend` serves it.
+	pub fn client_kademlia(&mut self) -> ClientKademlia {
+		self.client_kademlia
+			.get_or_insert_with(|| {
+				let (tx, rx) = tracing_unbounded("mpsc_client_kademlia", 100);
+				(ClientKademlia { tx }, rx)
+			})
+			.0
+			.clone()
 	}
 
 	/// Get handle to [`PeerStore`].

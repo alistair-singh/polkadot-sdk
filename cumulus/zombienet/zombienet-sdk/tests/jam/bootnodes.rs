@@ -24,8 +24,8 @@
 //!
 //! A second test runs two paras. Para A lists only its collator `alpha`. Para B's collator
 //! follows A's record (`--jam-bootnodes-from`), joins A's DHT through `alpha` and from there finds
-//! and connects to `beta`, which no record names. Kademlia instances only start with the network,
-//! so `gamma` is paused while the record is written and restarted once it is finalized.
+//! and connects to `beta`, which no record names. A publishes its record after `gamma` has started,
+//! so `gamma` joins A's DHT while running.
 
 use anyhow::Context;
 use codec::Encode;
@@ -133,20 +133,20 @@ async fn another_para_finds_peers_through_the_listed_bootnode() -> Result<(), an
 		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
 		let alpha_addr = format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws");
 		let listed = address(&alpha, &alpha_addr);
-		let gamma = jam.network.get_node("gamma")?;
-		gamma.pause().await?;
+		// No record names para 0's DHT yet, so gamma has no way to reach its nodes.
+		for peer in [&alpha_peer, &beta_peer] {
+			anyhow::ensure!(
+				log_lines_with(&jam, "gamma", &[CONNECTED, peer]).await?.is_empty(),
+				"gamma reached {peer} before para 0 published its bootnodes",
+			);
+		}
 		set_bootnodes(&jam, &a, &[&listed], None).await?;
 		let key = kv_storage_key(a.id, BOOTNODES_KEY);
 		let expected = record(genesis, "", &[&listed]);
 		wait_for_record(&jam, &key, Some(expected)).await?;
-		for peer in [&alpha_peer, &beta_peer] {
-			anyhow::ensure!(
-				log_lines_with(&jam, "gamma", &[CONNECTED, peer]).await?.is_empty(),
-				"gamma reached {peer} before joining para 0's DHT",
-			);
-		}
-		gamma.restart(None).await?;
 
+		// The record appeared after gamma started, so gamma joins the DHT while running.
+		wait_for_log(&jam, "gamma", &["Joined the para's DHT."]).await?;
 		let dialed = format!("endpoint=Dialer {{ address: {alpha_addr}/p2p/{alpha_peer}");
 		wait_for_log(&jam, "gamma", &[CONNECTED, &dialed]).await?;
 		wait_for_log(&jam, "gamma", &["Discovered a peer of para 0.", &beta_peer]).await?;

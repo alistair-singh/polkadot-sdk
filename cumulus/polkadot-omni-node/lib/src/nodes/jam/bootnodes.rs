@@ -20,11 +20,9 @@
 //! under [`BOOTNODES_KEY`]. For every para this node exchanges messages with, it runs a client-mode
 //! Kademlia instance on that para's DHT, seeded with the record's addresses, to find its peers.
 //!
-//! litep2p starts Kademlia instances only when the network is created, so the records are read
-//! once before that. A para without a record at that point gets no instance, and a record that
-//! later needs a new one is a [`todo!`]: adding an instance at runtime needs litep2p support.
-//!
 //! The reader follows JAM's finalized chain, so it never acts on a value that is later reverted.
+//! It opens the instance when a record first appears, and a new one when a record names another
+//! genesis hash or fork id.
 //!
 //! `pallet-bootnodes` checks what it publishes, and the record's genesis hash can only be checked
 //! there. The reader still skips what it could not use, since the other para's runtime is not
@@ -33,43 +31,28 @@
 
 use super::LOG_TARGET;
 use codec::DecodeAll;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use ip_network::IpNetwork;
 use jam_interface::{JamChainSource, JamStateSource, ServiceId};
-use jam_rpc_interface::JamRpcInterface;
 use pallet_bootnodes::{BootnodeRecord, BOOTNODES_KEY};
 use sc_network::{
-	config::{Litep2pKademliaEvent, Litep2pKademliaHandle},
+	config::{ClientKademlia, Litep2pKademliaEvent, Litep2pKademliaHandle},
 	multiaddr::Protocol,
 	Multiaddr, PeerId,
 };
-use std::{
-	collections::{HashMap, HashSet},
-	sync::Arc,
-	time::Duration,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 /// How often the reader asks a para's DHT for more of its peers.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A client-mode Kademlia instance on a para's DHT.
-pub(crate) struct Dht {
+struct Dht {
 	handle: Litep2pKademliaHandle,
 	/// The record the instance was opened for.
 	record: BootnodeRecord,
 }
 
 impl Dht {
-	/// Open an instance on the DHT `record` names, through `add`.
-	pub(crate) fn open(
-		record: BootnodeRecord,
-		add: impl FnOnce(&[u8; 32], Option<&str>) -> Litep2pKademliaHandle,
-	) -> Self {
-		let fork_id = core::str::from_utf8(&record.fork_id).ok().filter(|id| !id.is_empty());
-		let handle = add(&record.genesis, fork_id);
-		Self { handle, record }
-	}
-
 	/// Whether `record` names the DHT this instance is on.
 	fn serves(&self, record: &BootnodeRecord) -> bool {
 		self.record.genesis == record.genesis && self.record.fork_id == record.fork_id
@@ -80,48 +63,6 @@ impl Dht {
 		for (peer_id, addr) in seeds(record, allow_private_ip) {
 			self.handle.add_known_peer(peer_id.into(), vec![addr.into()]).await;
 		}
-	}
-}
-
-/// The records of `paras` at JAM's finalized block, to open their DHTs before the network starts.
-/// A para with no record, or that cannot be read, is left out.
-pub(crate) fn records_at_startup(
-	rpc_urls: &[url::Url],
-	parachain_service: ServiceId,
-	paras: &[u32],
-	tokio_handle: tokio::runtime::Handle,
-) -> HashMap<u32, BootnodeRecord> {
-	if paras.is_empty() {
-		return HashMap::new();
-	}
-	let read = async {
-		let (jam, worker) = JamRpcInterface::new(rpc_urls.to_vec()).await?;
-		tokio_handle.spawn(worker);
-		let at = jam.finalized_block().await?.header_hash;
-		let mut records = HashMap::new();
-		for &para_id in paras {
-			let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
-			let value = jam.service_value(at, parachain_service, &key).await?;
-			match decode(value.as_deref()) {
-				Ok(Some(record)) => {
-					records.insert(para_id, record);
-				},
-				Ok(None) => {
-					tracing::warn!(target: LOG_TARGET, para_id, "The para has no bootnode record yet, so this node cannot join its DHT.");
-				},
-				Err(error) => {
-					tracing::warn!(target: LOG_TARGET, para_id, ?error, "The para's bootnode record does not decode, so this node cannot join its DHT.");
-				},
-			}
-		}
-		Ok::<_, Box<dyn std::error::Error>>(records)
-	};
-	match tokio::task::block_in_place(|| tokio_handle.block_on(read)) {
-		Ok(records) => records,
-		Err(error) => {
-			tracing::error!(target: LOG_TARGET, %error, "Unable to read the bootnode records from JAM.");
-			HashMap::new()
-		},
 	}
 }
 
@@ -180,53 +121,64 @@ async fn next_event(dht: &mut Option<Dht>) -> Option<Litep2pKademliaEvent> {
 	}
 }
 
-/// Follow `para_id`'s published record at JAM's finalized block, and discover the para's peers
-/// through `dht`, its open instance if any. Returns when the subscription ends.
-///
-/// A value that does not decode, or a cleared record, leaves the DHT as it is.
-pub(crate) async fn follow<Jam: JamStateSource + ?Sized>(
+/// Follow `para_id`'s published record at JAM's finalized block, and discover the para's peers on
+/// its DHT. Returns when the subscription ends.
+pub(crate) async fn follow<Jam: JamChainSource + JamStateSource + ?Sized>(
 	jam: Arc<Jam>,
 	parachain_service: ServiceId,
 	para_id: u32,
 	allow_private_ip: bool,
-	mut dht: Option<Dht>,
+	kademlia: ClientKademlia,
 ) {
 	let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
-	let mut values = match jam.service_value_stream(parachain_service, &key, true).await {
-		Ok(values) => values,
+	// Subscribed before reading the current value, so that no change in between is missed.
+	let values = match jam.service_value_stream(parachain_service, &key, true).await {
+		Ok(values) => values.map(|update| update.value),
 		Err(error) => {
 			tracing::error!(target: LOG_TARGET, para_id, ?error, "Unable to follow the para's bootnodes on JAM.");
 			return;
 		},
 	};
+	let current = match jam.finalized_block().await {
+		Ok(finalized) => jam.service_value(finalized.header_hash, parachain_service, &key).await,
+		Err(error) => Err(error),
+	};
+	let current = match current {
+		Ok(current) => current,
+		Err(error) => {
+			tracing::error!(target: LOG_TARGET, para_id, ?error, "Unable to read the para's bootnodes on JAM.");
+			return;
+		},
+	};
 	tracing::info!(target: LOG_TARGET, para_id, "Following the para's bootnodes on JAM.");
 
-	// The subscription only reports changes, so the record the instance was opened for seeds it.
-	if let Some(dht) = &mut dht {
-		let record = dht.record.clone();
-		dht.seed(&record, allow_private_ip).await;
-	}
+	discover(current, values, para_id, allow_private_ip, kademlia).await;
+	tracing::warn!(target: LOG_TARGET, para_id, "The subscription to the para's bootnodes ended.");
+}
+
+/// Act on the `current` published value and then on each of `values`, while discovering the
+/// para's peers on the DHT the latest record names. Returns when `values` ends.
+async fn discover(
+	current: Option<Vec<u8>>,
+	mut values: impl Stream<Item = Option<Vec<u8>>> + Unpin,
+	para_id: u32,
+	allow_private_ip: bool,
+	kademlia: ClientKademlia,
+) {
+	let mut dht = None;
+	on_value(&mut dht, &kademlia, para_id, allow_private_ip, current).await;
 
 	// Outlives evictions from the routing table, for the offchain-messaging requests to come.
 	// TODO: cap the set. A responder can return fresh peer ids on every query.
 	let mut discovered = HashSet::new();
 	let mut discovery = tokio::time::interval(DISCOVERY_INTERVAL);
+	// A DHT opened late is queried once, not once for every interval it missed.
+	discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 	loop {
 		tokio::select! {
-			update = values.next() => {
-				let Some(update) = update else { break };
-				let record = match decode(update.value.as_deref()) {
-					Ok(Some(record)) => record,
-					Ok(None) => continue,
-					Err(error) => {
-						tracing::warn!(target: LOG_TARGET, para_id, at = ?update.header_hash, ?error, "The para's bootnode record does not decode; keeping the DHT as it is.");
-						continue;
-					},
-				};
-				match &mut dht {
-					Some(dht) if dht.serves(&record) => dht.seed(&record, allow_private_ip).await,
-					_ => todo!("adding a Kademlia instance at runtime needs litep2p support"),
-				}
+			value = values.next() => {
+				let Some(value) = value else { break };
+				on_value(&mut dht, &kademlia, para_id, allow_private_ip, value).await;
 			},
 			event = next_event(&mut dht) => {
 				let Some(Litep2pKademliaEvent::FindNodeSuccess { peers, .. }) = event else { continue };
@@ -246,7 +198,39 @@ pub(crate) async fn follow<Jam: JamStateSource + ?Sized>(
 			},
 		}
 	}
-	tracing::warn!(target: LOG_TARGET, para_id, "The subscription to the para's bootnodes ended.");
+}
+
+/// Seed `dht` with the record in `value`, opening an instance first if the record names a DHT
+/// `dht` is not on. A value that does not decode, a cleared record, or an instance that cannot be
+/// opened leaves `dht` as it is.
+async fn on_value(
+	dht: &mut Option<Dht>,
+	kademlia: &ClientKademlia,
+	para_id: u32,
+	allow_private_ip: bool,
+	value: Option<Vec<u8>>,
+) {
+	let record = match decode(value.as_deref()) {
+		Ok(Some(record)) => record,
+		Ok(None) => return,
+		Err(error) => {
+			tracing::warn!(target: LOG_TARGET, para_id, ?error, "The para's bootnode record does not decode; keeping the DHT as it is.");
+			return;
+		},
+	};
+	if !dht.as_ref().is_some_and(|dht| dht.serves(&record)) {
+		let fork_id = core::str::from_utf8(&record.fork_id).ok().filter(|id| !id.is_empty());
+		let Some(handle) = kademlia.open(&record.genesis, fork_id).await else {
+			tracing::warn!(target: LOG_TARGET, para_id, "Unable to join the para's DHT; keeping the DHT as it is.");
+			return;
+		};
+		tracing::info!(target: LOG_TARGET, para_id, "Joined the para's DHT.");
+		// Dropping the previous instance stops it.
+		*dht = Some(Dht { handle, record: record.clone() });
+	}
+	if let Some(dht) = dht {
+		dht.seed(&record, allow_private_ip).await;
+	}
 }
 
 #[cfg(test)]
@@ -316,89 +300,47 @@ mod tests {
 		assert_eq!(seeds(&record, true).len(), 5);
 	}
 
-	/// A JAM source with scripted value updates. It records whether the reader asked for the
-	/// finalized chain.
-	#[derive(Default)]
-	struct ScriptedJam {
-		values: std::sync::Mutex<Vec<jam_interface::ChainSubUpdate<Option<Vec<u8>>>>>,
-		finalized: std::sync::Mutex<Option<bool>>,
+	/// A network configuration whose backend never runs, and its handle. While the configuration
+	/// lives, opening an instance waits forever; once it is dropped, opening fails.
+	type Block = sp_runtime::generic::Block<
+		sp_runtime::generic::Header<u32, sp_runtime::traits::BlakeTwo256>,
+		sp_runtime::OpaqueExtrinsic,
+	>;
+	type Config = sc_network::config::FullNetworkConfiguration<
+		Block,
+		sp_core::H256,
+		sc_network::Litep2pNetworkBackend,
+	>;
+
+	fn kademlia() -> (Config, ClientKademlia) {
+		let mut config = Config::new(&sc_network::config::NetworkConfiguration::new_local(), None);
+		let kademlia = config.client_kademlia();
+		(config, kademlia)
 	}
 
-	#[async_trait::async_trait]
-	impl JamStateSource for ScriptedJam {
-		async fn service_value_stream(
-			&self,
-			_service: ServiceId,
-			_key: &[u8],
-			finalized: bool,
-		) -> jam_interface::Result<
-			jam_interface::BoxStream<'static, jam_interface::ChainSubUpdate<Option<Vec<u8>>>>,
-		> {
-			*self.finalized.lock().unwrap() = Some(finalized);
-			let updates = std::mem::take(&mut *self.values.lock().unwrap());
-			// The value stream ends after its updates, which ends the reader.
-			Ok(futures::stream::iter(updates).boxed())
-		}
-
-		async fn state_value(
-			&self,
-			_: jam_interface::HeaderHash,
-			_: jam_interface::StorageKey,
-		) -> jam_interface::Result<Option<Vec<u8>>> {
-			unimplemented!("the reader only subscribes")
-		}
-
-		async fn state_value_stream(
-			&self,
-			_: jam_interface::StorageKey,
-			_: bool,
-		) -> jam_interface::Result<
-			jam_interface::BoxStream<'static, jam_interface::ChainSubUpdate<Option<Vec<u8>>>>,
-		> {
-			unimplemented!("the reader only reads service values")
-		}
-
-		async fn state_proof(
-			&self,
-			_: jam_interface::HeaderHash,
-			_: jam_interface::StorageKey,
-			_: jam_interface::StorageKey,
-			_: u32,
-		) -> jam_interface::Result<jam_interface::RangeProof> {
-			unimplemented!("the reader reads no proofs")
-		}
-
-		async fn service_value(
-			&self,
-			_: jam_interface::HeaderHash,
-			_: ServiceId,
-			_: &[u8],
-		) -> jam_interface::Result<Option<Vec<u8>>> {
-			unimplemented!("the reader only subscribes")
-		}
-	}
-
-	impl ScriptedJam {
-		fn with_values(values: impl IntoIterator<Item = Option<Vec<u8>>>) -> Arc<Self> {
-			let values = values
-				.into_iter()
-				.map(|value| jam_interface::ChainSubUpdate {
-					header_hash: Default::default(),
-					slot: 0,
-					value,
-				})
-				.collect();
-			Arc::new(Self { values: std::sync::Mutex::new(values), ..Default::default() })
-		}
-	}
-
-	/// A value that is later reverted must never be acted on. Garbage and a cleared record leave
-	/// things as they are, so this run reaches the end of the stream.
+	/// Garbage and a cleared record open no instance, so this run reaches the end of the stream
+	/// although opening one would wait forever.
 	#[tokio::test]
-	async fn the_reader_follows_finalized_jam_and_ignores_garbage() {
-		let jam = ScriptedJam::with_values([None, Some(vec![0x04, 0xff])]);
+	async fn garbage_and_cleared_values_open_no_dht() {
+		let (_config, kademlia) = kademlia();
+		let values = futures::stream::iter([None, Some(vec![0x04, 0xff])]);
 
-		follow(jam.clone(), 1337, 0, true, None).await;
-		assert_eq!(*jam.finalized.lock().unwrap(), Some(true));
+		let run = discover(Some(vec![0xff]), values, 0, true, kademlia);
+		tokio::time::timeout(Duration::from_secs(5), run)
+			.await
+			.expect("no instance is opened");
+	}
+
+	/// A DHT that cannot be joined is logged and skipped, so this run reaches the end of the
+	/// stream.
+	#[tokio::test]
+	async fn a_record_whose_dht_cannot_be_joined_is_skipped() {
+		let (config, kademlia) = kademlia();
+		drop(config);
+		let record = record(&[(1, "/ip4/8.8.8.8/tcp/1")]).encode();
+		let values = futures::stream::iter([Some(record.clone())]);
+
+		let run = discover(Some(record), values, 0, true, kademlia);
+		tokio::time::timeout(Duration::from_secs(5), run).await.expect("the run ends");
 	}
 }

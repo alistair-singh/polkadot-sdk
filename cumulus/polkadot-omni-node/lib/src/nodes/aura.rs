@@ -595,26 +595,12 @@ where
 			sc_network::config::TransportConfig::Normal { allow_private_ip: true, .. },
 		);
 
-		let bootnode_records = jam::bootnodes::records_at_startup(
-			&jam_params.rpc_urls,
-			jam_params.service_id,
-			&jam_params.bootnodes_from,
-			config.tokio_handle.clone(),
-		);
 		let mut net_config =
 			FullNetworkConfiguration::<_, _, sc_network::Litep2pNetworkBackend>::new(
 				&config.network,
 				None,
 			);
-		let mut bootnode_dhts: std::collections::HashMap<_, _> = bootnode_records
-			.into_iter()
-			.map(|(para, record)| {
-				let dht = jam::bootnodes::Dht::open(record, |genesis, fork_id| {
-					net_config.add_client_kademlia(genesis, fork_id)
-				});
-				(para, dht)
-			})
-			.collect();
+		let client_kademlia = net_config.client_kademlia();
 
 		let metrics = NotificationMetrics::new(None);
 		let import_queue_service = import_queue.service();
@@ -757,7 +743,7 @@ where
 							jam_params.service_id,
 							other_para,
 							allow_private_ip,
-							bootnode_dhts.remove(&other_para),
+							client_kademlia.clone(),
 						)),
 					);
 				}

@@ -960,7 +960,7 @@ linked-hash-map = { version = "0.5.4" }
 linked_hash_set = { version = "0.1.4" }
 linregress = { version = "0.5.1" }
 lite-json = { version = "0.2.0", default-features = false }
-litep2p = { version = "0.16.0", features = ["rsa", "webrtc", "websocket"] }
+litep2p = { version = "0.17.0", features = ["rsa", "webrtc", "websocket"] }
 log = { version = "0.4.22", default-features = false }
 macro_magic = { version = "0.5.1" }
 maplit = { version = "1.0.2" }
@@ -1618,3 +1618,7 @@ twox-hash = { opt-level = 3 }
 wasmi = { opt-level = 3 }
 x25519-dalek = { opt-level = 3 }
 zeroize = { opt-level = 3 }
+
+[patch.crates-io]
+# Runtime Kademlia registration, until it is released.
+litep2p = { path = "../litep2p-runtime-kad" }

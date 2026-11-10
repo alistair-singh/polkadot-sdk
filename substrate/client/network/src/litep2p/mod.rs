@@ -159,6 +159,9 @@ pub struct Litep2pNetworkBackend {
 	/// Main `litep2p` object.
 	litep2p: Litep2p,
 
+	/// Requests to open client-mode Kademlia instances.
+	client_kademlia: Option<TracingUnboundedReceiver<crate::config::ClientKademliaRequest>>,
+
 	/// `NetworkService` implementation for `Litep2pNetworkBackend`.
 	network_service: Arc<dyn NetworkService>,
 
@@ -249,7 +252,30 @@ impl Litep2pNetworkBackend {
 	}
 }
 
+/// The next request to open a client-mode Kademlia instance, or never without a receiver.
+async fn next_client_kademlia_request(
+	rx: &mut Option<TracingUnboundedReceiver<crate::config::ClientKademliaRequest>>,
+) -> Option<crate::config::ClientKademliaRequest> {
+	match rx {
+		Some(rx) => rx.next().await,
+		None => futures::future::pending().await,
+	}
+}
+
 impl Litep2pNetworkBackend {
+	/// Register the requested client-mode Kademlia instance and hand back its handle.
+	fn open_client_kademlia(&mut self, request: crate::config::ClientKademliaRequest) {
+		match self.litep2p.register_kademlia(request.config) {
+			Ok(()) => {
+				let _ = request.reply.send(request.handle);
+			},
+			Err(error) => log::warn!(
+				target: LOG_TARGET,
+				"Unable to open a client-mode Kademlia instance: {error:?}",
+			),
+		}
+	}
+
 	/// Get `litep2p` keypair from `NodeKeyConfig`.
 	fn get_keypair(node_key: &NodeKeyConfig) -> Result<(Keypair, litep2p::PeerId), Error> {
 		let secret: litep2p::crypto::ed25519::SecretKey =
@@ -561,10 +587,6 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 			}
 		}
 
-		for config in std::mem::take(&mut params.network_config.client_kademlia) {
-			config_builder = config_builder.with_libp2p_kademlia(config);
-		}
-
 		config_builder = config_builder
 			.with_known_addresses(known_addresses.clone().into_iter())
 			.with_libp2p_ping(ping_config)
@@ -624,6 +646,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 		}
 
 		Ok(Self {
+			client_kademlia: params.network_config.client_kademlia.take().map(|(_, rx)| rx),
 			network_service,
 			cmd_rx,
 			metrics,
@@ -706,6 +729,10 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 			self.num_connected.store(num_connected_peers, Ordering::Relaxed);
 
 			tokio::select! {
+				request = next_client_kademlia_request(&mut self.client_kademlia) => match request {
+					Some(request) => self.open_client_kademlia(request),
+					None => self.client_kademlia = None,
+				},
 				command = self.cmd_rx.next() => match command {
 					None => return,
 					Some(command) => match command {
