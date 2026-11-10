@@ -208,6 +208,7 @@ pub(crate) async fn follow<Jam: JamStateSource + ?Sized>(
 	}
 
 	// Outlives evictions from the routing table, for the offchain-messaging requests to come.
+	// TODO: cap the set. A responder can return fresh peer ids on every query.
 	let mut discovered = HashSet::new();
 	let mut discovery = tokio::time::interval(DISCOVERY_INTERVAL);
 	loop {
