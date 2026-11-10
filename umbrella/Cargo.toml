@@ -928,7 +928,6 @@ node = [
 	"generate-bags",
 	"mmr-gadget",
 	"mmr-rpc",
-	"pallet-bootnodes-cli",
 	"pallet-contracts-mock-network",
 	"pallet-transaction-payment-rpc",
 	"parachains-runtimes-test-utils",
@@ -1406,11 +1405,6 @@ path = "../substrate/frame/beefy-mmr"
 default-features = false
 optional = true
 path = "../substrate/frame/bootnodes"
-
-[dependencies.pallet-bootnodes-cli]
-default-features = false
-optional = true
-path = "../substrate/frame/bootnodes/cli"
 
 [dependencies.pallet-bounties]
 default-features = false

@@ -590,6 +590,10 @@ where
 		);
 
 		let is_authority = config.role.is_authority();
+		let allow_private_ip = matches!(
+			config.network.transport,
+			sc_network::config::TransportConfig::Normal { allow_private_ip: true, .. },
+		);
 
 		let net_config = FullNetworkConfiguration::<_, _, sc_network::Litep2pNetworkBackend>::new(
 			&config.network,
@@ -731,9 +735,6 @@ where
 
 				for &other_para in &jam_params.bootnodes_from {
 					let network = bootnodes_network.clone();
-					// Proofs of possession are checked against this para's own JAM genesis hash:
-					// both paras are on the same JAM.
-					let own_client = client.clone();
 					spawn.spawn(
 						"jam-bootnodes",
 						Some("jam"),
@@ -741,7 +742,7 @@ where
 							jam.clone(),
 							jam_params.service_id,
 							other_para,
-							move || jam::bootnodes::own_jam_genesis_hash(&*own_client),
+							allow_private_ip,
 							move |peer_id, addr| network.add_known_address(peer_id, addr),
 						)),
 					);

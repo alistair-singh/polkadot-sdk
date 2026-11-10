@@ -13033,40 +13033,16 @@ dependencies = [
 name = "pallet-bootnodes"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "frame-benchmarking",
  "frame-support",
  "frame-system",
  "multiaddr",
  "parity-scale-codec",
  "scale-info",
- "serde",
- "serde_json",
- "sp-api 26.0.0",
  "sp-core 28.0.0",
  "sp-io 30.0.0",
- "sp-keystore 0.34.0",
  "sp-runtime 31.0.1",
-]
-
-[[package]]
-name = "pallet-bootnodes-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "array-bytes 6.2.2",
- "clap",
- "frame-metadata 23.0.1",
- "jsonrpsee 0.24.11",
- "multiaddr",
- "pallet-bootnodes",
- "parity-scale-codec",
- "sc-network-types 0.10.0",
- "serde",
- "serde_json",
- "sp-core 28.0.0",
- "sp-crypto-hashing 0.1.0",
- "tokio",
- "zeroize",
 ]
 
 [[package]]
@@ -17717,6 +17693,7 @@ dependencies = [
  "frame-try-runtime",
  "futures",
  "futures-timer",
+ "ip_network",
  "jam-codec",
  "jam-std-common",
  "jam-types",
@@ -18203,7 +18180,6 @@ dependencies = [
  "pallet-beefy",
  "pallet-beefy-mmr",
  "pallet-bootnodes",
- "pallet-bootnodes-cli",
  "pallet-bounties",
  "pallet-bridge-grandpa",
  "pallet-bridge-messages",

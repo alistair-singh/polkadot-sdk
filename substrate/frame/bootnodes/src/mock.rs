@@ -19,10 +19,8 @@
 
 use crate as pallet_bootnodes;
 use core::cell::{Cell, RefCell};
-use frame_support::{derive_impl, traits::ConstU32};
+use frame_support::derive_impl;
 use frame_system::EnsureRoot;
-use sp_core::H256;
-use sp_keystore::{testing::MemoryKeystore, KeystoreExt};
 use sp_runtime::{BuildStorage, DispatchError, DispatchResult};
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -39,22 +37,10 @@ impl frame_system::Config for Test {
 	type Block = Block;
 }
 
-pub const PARA_ID: u32 = 2_000;
-pub const MAX_BOOTNODES: u32 = 4;
-pub const MAX_ADDR_LEN: u32 = 128;
-
-/// The JAM genesis hash [`new_test_ext`] sets.
-pub const JAM_GENESIS_HASH: H256 = H256::repeat_byte(0x4a);
-
 impl pallet_bootnodes::Config for Test {
-	type AdminOrigin = EnsureRoot<u64>;
-	type ParaId = ConstU32<PARA_ID>;
-	type MaxBootnodes = ConstU32<MAX_BOOTNODES>;
-	type MaxAddrLen = ConstU32<MAX_ADDR_LEN>;
+	type BootnodesOrigin = EnsureRoot<u64>;
 	type Publisher = RecordingPublisher;
 	type WeightInfo = ();
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = ();
 }
 
 thread_local! {
@@ -65,20 +51,20 @@ thread_local! {
 /// The error [`RecordingPublisher`] returns while [`fail_publishing`] is set.
 pub const PUBLISH_FAILED: DispatchError = DispatchError::Other("publish failed");
 
-/// Records every published set, or fails while [`fail_publishing`] is set.
+/// Records every published record, or fails while [`fail_publishing`] is set.
 pub struct RecordingPublisher;
 
 impl pallet_bootnodes::PublishBootnodes for RecordingPublisher {
-	fn publish(set: Option<&[u8]>) -> DispatchResult {
+	fn publish(record: Option<&[u8]>) -> DispatchResult {
 		if PUBLISH_FAILS.get() {
 			return Err(PUBLISH_FAILED);
 		}
-		PUBLISHED.with_borrow_mut(|published| published.push(set.map(<[u8]>::to_vec)));
+		PUBLISHED.with_borrow_mut(|published| published.push(record.map(<[u8]>::to_vec)));
 		Ok(())
 	}
 }
 
-/// The sets published since the last call, oldest first.
+/// The records published since the last call, oldest first.
 pub fn take_published() -> Vec<Option<Vec<u8>>> {
 	PUBLISHED.take()
 }
@@ -88,20 +74,13 @@ pub fn fail_publishing(fail: bool) {
 	PUBLISH_FAILS.set(fail);
 }
 
-/// Test externalities with [`JAM_GENESIS_HASH`] set and no bootnodes.
+/// The hash block 1 is built on, so what `block_hash(0)` returns in [`new_test_ext`].
+pub const GENESIS_HASH: sp_core::H256 = sp_core::H256::repeat_byte(0x4a);
+
+/// Test externalities inside block 1.
 pub fn new_test_ext() -> sp_io::TestExternalities {
-	let storage = RuntimeGenesisConfig {
-		bootnodes: pallet_bootnodes::GenesisConfig {
-			jam_genesis_hash: Some(JAM_GENESIS_HASH),
-			..Default::default()
-		},
-		..Default::default()
-	}
-	.build_storage()
-	.unwrap();
+	let storage = RuntimeGenesisConfig::default().build_storage().unwrap();
 	let mut ext = sp_io::TestExternalities::new(storage);
-	// The default `BenchmarkHelper` signs through the keystore.
-	ext.register_extension(KeystoreExt::new(MemoryKeystore::new()));
-	ext.execute_with(|| System::set_block_number(1));
+	ext.execute_with(|| System::initialize(&1, &GENESIS_HASH, &Default::default()));
 	ext
 }

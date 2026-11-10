@@ -15,27 +15,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A para's bootnode set is published to JAM and can be read back.
+//! A para's bootnode record is published to JAM and can be read back.
 //!
-//! Every `Bootnodes::add_bootnode` / `remove_bootnode` publishes the SCALE-encoded set through
-//! `JamKv` under [`BOOTNODES_KEY`], or removes the key once the set is empty. The test lists two
-//! bootnodes with sudo, replaces one, removes both, and after each change waits for
-//! `serviceValue` on the Parachain Service to hold exactly the set the para now stores.
+//! `Bootnodes::set_bootnodes` publishes a SCALE-encoded `BootnodeRecord` through `JamKv` under
+//! [`BOOTNODES_KEY`], and `clear_bootnodes` removes the key. The first test sets and replaces the
+//! record with sudo, and after each change waits for `serviceValue` on the Parachain Service to
+//! hold exactly the expected record, including the para's real genesis hash.
 //!
-//! A second test runs two paras. Para B's collator follows para A's set (`--jam-bootnodes-from`)
+//! A second test runs two paras. Para B's collator follows para A's record (`--jam-bootnodes-from`)
 //! and, once A lists its collator `alpha`, dials it. The two run different chains, so `alpha`
 //! refuses B's sync protocol; the connection itself is what shows B found A through JAM: B has
 //! no other way to learn `alpha`'s address, and the handshake checks the peer id. `alpha` is
 //! listed at a dead port first and then moved, so the connection also shows the reader follows a
-//! replaced entry. Root on A then writes a set past the pallet with `JamKv::set_kv`, and B dials
-//! only the entries the pallet would have accepted, whose node signed them and whose lease holds:
-//! an entry that expired before it was written is never learned, nor one signed by another key,
-//! and `beta`'s short lease expires on B without A writing again.
-//!
-//! JAM's genesis embeds each para's genesis head, so no para can carry the JAM genesis hash in its
-//! genesis. Each test first sets it with sudo on every para, from the genesis header in the JAM
-//! chain spec, checked against JAM itself; entries are signed under it. Para B's reader checks
-//! A's entries against B's own hash.
+//! replaced address.
 
 use anyhow::Context;
 use codec::Encode;
@@ -47,9 +39,9 @@ use cumulus_jam_zombienet_tests::{
 use cumulus_zombienet_sdk_helpers::{
 	coretime::sudo_call, submit_extrinsic_and_wait_for_best_block_success,
 };
-use pallet_bootnodes::BOOTNODES_KEY;
+use pallet_bootnodes::{BootnodeRecord, BOOTNODES_KEY};
 use pallet_jam_kv::kv_storage_key;
-use sp_core::{ed25519, Pair as _, H256};
+use sp_core::{ed25519, Pair as _};
 use std::{
 	collections::HashMap,
 	time::{Duration, Instant},
@@ -58,16 +50,6 @@ use zombienet_sdk::{
 	subxt::{dynamic::Value, tx::dynamic},
 	subxt_signer::sr25519::dev,
 };
-
-/// The runtime's `MAX_BOOTNODE_ADDR_LEN`, checked against its metadata before the test starts.
-const MAX_ADDR_LEN: u32 = 128;
-
-/// A bootnode entry. The address bound only matters for decoding; the encoding is the runtime's.
-type Bootnode = pallet_bootnodes::Bootnode<frame_support::traits::ConstU32<MAX_ADDR_LEN>>;
-
-/// A lease that never ends: JAM slots count from the JAM epoch, so they are already in the
-/// millions.
-const EXPIRY_SLOT: u32 = u32::MAX;
 
 /// The para must be producing blocks before a call can land in one.
 const BLOCKS: u64 = 5;
@@ -86,30 +68,21 @@ async fn bootnodes_are_published_to_jam() -> Result<(), anyhow::Error> {
 	let jam = spawn("bootnodes_are_published_to_jam", paras, SpawnOptions::new(TINY_CORES)).await?;
 	let result = async {
 		wait_for_collators(&jam.network, paras, BLOCKS, FINALIZED, DEADLINE.as_secs()).await?;
-		check_max_addr_len(&jam, &para).await?;
-		let signer = Signer::new(set_jam_genesis_hash(&jam, paras).await?, para.id);
+		let genesis = genesis_hash(&jam, &para).await?;
 		let key = kv_storage_key(para.id, BOOTNODES_KEY);
-		let (alpha, beta) = (node_key(1), node_key(2));
+		let alpha = address(&node_key(1), "/ip4/127.0.0.1/tcp/30333");
+		let beta = address(&node_key(2), "/dns/beta.example.org/tcp/30334/ws");
 
-		let alpha_entry = signer.entry(&alpha, "/ip4/127.0.0.1/tcp/30333");
-		add_bootnode(&jam, &para, &alpha_entry).await?;
-		wait_for_set(&jam, &key, &[&alpha_entry]).await?;
+		set_bootnodes(&jam, &para, &[&alpha], Some("fork-1")).await?;
+		wait_for_record(&jam, &key, Some(record(genesis, "fork-1", &[&alpha]))).await?;
 
-		let beta_entry = signer.entry(&beta, "/dns/beta.example.org/tcp/30334/ws");
-		add_bootnode(&jam, &para, &beta_entry).await?;
-		wait_for_set(&jam, &key, &[&alpha_entry, &beta_entry]).await?;
+		// A new call replaces the whole record.
+		set_bootnodes(&jam, &para, &[&beta, &alpha], None).await?;
+		wait_for_record(&jam, &key, Some(record(genesis, "", &[&beta, &alpha]))).await?;
 
-		// The same node key replaces its entry in place.
-		let alpha_moved = signer.entry(&alpha, "/ip4/127.0.0.1/tcp/40333");
-		add_bootnode(&jam, &para, &alpha_moved).await?;
-		wait_for_set(&jam, &key, &[&alpha_moved, &beta_entry]).await?;
-
-		remove_bootnode(&jam, &para, &alpha.public()).await?;
-		wait_for_set(&jam, &key, &[&beta_entry]).await?;
-
-		// Removing the last entry removes the key.
-		remove_bootnode(&jam, &para, &beta.public()).await?;
-		wait_for_set(&jam, &key, &[]).await
+		// Clearing the record removes the key.
+		submit(&jam, &para, "Bootnodes", "clear_bootnodes", vec![]).await?;
+		wait_for_record(&jam, &key, None).await
 	}
 	.await;
 
@@ -141,8 +114,7 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 	let jam = spawn("another_para_dials_the_listed_bootnodes", &paras, options).await?;
 	let result = async {
 		wait_for_collators(&jam.network, &paras, BLOCKS, FINALIZED, DEADLINE.as_secs()).await?;
-		check_max_addr_len(&jam, &a).await?;
-		let signer = Signer::new(set_jam_genesis_hash(&jam, &paras).await?, a.id);
+		let genesis = genesis_hash(&jam, &a).await?;
 		wait_for_log(&jam, "gamma", &["Following the para's bootnodes on JAM."]).await?;
 
 		let (alpha, beta) = (network_key("alpha"), network_key("beta"));
@@ -159,72 +131,40 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
 		let key = kv_storage_key(a.id, BOOTNODES_KEY);
 		let stale_addr = format!("/ip4/127.0.0.1/tcp/{}/ws", free_port()?);
-		let stale = signer.entry(&alpha, &stale_addr);
-		add_bootnode(&jam, &a, &stale).await?;
-		wait_for_set(&jam, &key, &[&stale]).await?;
+		let stale = address(&alpha, &stale_addr);
+		set_bootnodes(&jam, &a, &[&stale], None).await?;
+		wait_for_record(&jam, &key, Some(record(genesis, "", &[&stale]))).await?;
 		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &stale_addr]).await?;
 
 		let alpha_addr = format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws");
-		let entry = signer.entry(&alpha, &alpha_addr);
-		add_bootnode(&jam, &a, &entry).await?;
-		wait_for_set(&jam, &key, &[&entry]).await?;
+		let moved = address(&alpha, &alpha_addr);
+		set_bootnodes(&jam, &a, &[&moved], None).await?;
+		wait_for_record(&jam, &key, Some(record(genesis, "", &[&moved]))).await?;
 		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &alpha_addr]).await?;
 		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &stale_addr])
 			.await?;
 		wait_for_connection(&jam, "gamma", &alpha_peer, &alpha_addr).await?;
 
-		remove_bootnode(&jam, &a, &alpha.public()).await?;
+		// The list is replaced as a whole: `beta` comes in and `alpha` drops off.
+		let beta_addr = format!("/ip4/127.0.0.1/tcp/{beta_port}/ws");
+		let beta_address = address(&beta, &beta_addr);
+		set_bootnodes(&jam, &a, &[&beta_address], None).await?;
+		wait_for_record(&jam, &key, Some(record(genesis, "", &[&beta_address]))).await?;
+		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
 		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &alpha_peer])
 			.await?;
-
-		// Root writes the set past the pallet: an entry the pallet would reject, one whose lease
-		// is already over, one whose node never signed it, and `beta` with a lease of
-		// `BETA_LEASE` slots.
-		let (rejected_key, expired_key, forged_key) = (node_key(9), node_key(8), node_key(7));
-		let rejected = signer.entry(&rejected_key, "/ip4/127.0.0.1/udp/30333/quic-v1");
-		let expired = signer.until(&expired_key, "/ip4/127.0.0.1/tcp/1/ws", 1);
-		// Signed by another key: root lists a node that did not consent.
-		let mut forged = signer.entry(&forged_key, "/ip4/127.0.0.1/tcp/2/ws");
-		forged.sig = signer.entry(&node_key(6), "/ip4/127.0.0.1/tcp/2/ws").sig;
-		let beta_expiry = u32::try_from(jam.jam_rpc.finalized_slot().await?)? + BETA_LEASE;
-		let beta_addr = format!("/ip4/127.0.0.1/tcp/{beta_port}/ws");
-		let beta_entry = signer.until(&beta, &beta_addr, beta_expiry);
-		// A `Vec`, not an array: SCALE gives arrays no length prefix.
-		let set = vec![&rejected, &expired, &forged, &beta_entry];
-		set_kv(&jam, &a, BOOTNODES_KEY, &set.encode()).await?;
-		wait_for_set(&jam, &key, &set).await?;
-		// All entries come from one update, so once `beta` is learned the others were skipped.
-		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
-		let skipped = [
-			(&rejected_key, "the pallet would reject"),
-			(&expired_key, "had expired"),
-			(&forged_key, "its node never signed"),
-		];
-		for (node, why) in skipped {
-			let peer = peer_id(node);
-			let learned = log_lines_with(&jam, "gamma", &["Learned a bootnode", &peer]).await?;
-			anyhow::ensure!(learned.is_empty(), "gamma learned the entry that {why}");
-		}
 		wait_for_connection(&jam, "gamma", &beta_peer, &beta_addr).await?;
 
-		// The value does not change again; `beta` drops off once JAM passes its expiry slot.
-		wait_for_log(&jam, "gamma", &["A bootnode of para 0 expired.", &beta_peer]).await?;
-		let at = jam.jam_rpc.finalized_slot().await?;
-		anyhow::ensure!(
-			at + 1 >= u64::from(beta_expiry),
-			"gamma dropped beta at finalized slot {at}, before its expiry slot {beta_expiry}",
-		);
-		Ok(())
+		submit(&jam, &a, "Bootnodes", "clear_bootnodes", vec![]).await?;
+		wait_for_record(&jam, &key, None).await?;
+		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &beta_peer])
+			.await
 	}
 	.await;
 
 	jam.destroy().await;
 	result
 }
-
-/// `beta`'s lease in the `set_kv` phase, in JAM slots (6 s each): long enough for the set to reach
-/// JAM and `gamma` to dial it, short enough to expire within [`KV_BUDGET`].
-const BETA_LEASE: u32 = 15;
 
 /// How long a node may take to dial a peer it just learned: its peerset fills free slots every
 /// second or so.
@@ -299,95 +239,45 @@ fn node_key(seed: u8) -> ed25519::Pair {
 	ed25519::Pair::from_seed(&[seed; 32])
 }
 
-/// Signs entries for one para under the JAM genesis hash the test set.
-struct Signer {
-	jam_genesis_hash: H256,
-	para_id: u32,
+/// `addr` with the peer id of `pair` appended, as `set_bootnodes` takes it.
+fn address(pair: &ed25519::Pair, addr: &str) -> String {
+	format!("{addr}/p2p/{}", peer_id(pair))
 }
 
-impl Signer {
-	fn new(jam_genesis_hash: H256, para_id: u32) -> Self {
-		Self { jam_genesis_hash, para_id }
-	}
-
-	/// An entry for `pair` at `addr`, with a lease past the test's end.
-	fn entry(&self, pair: &ed25519::Pair, addr: &str) -> Bootnode {
-		self.until(pair, addr, EXPIRY_SLOT)
-	}
-
-	/// An entry for `pair` at `addr`, with the lease ending at `expiry_slot`.
-	fn until(&self, pair: &ed25519::Pair, addr: &str, expiry_slot: u32) -> Bootnode {
-		let addr: multiaddr::Multiaddr = addr.parse().expect("the test's addresses parse; qed");
-		let addr: frame_support::BoundedVec<u8, _> =
-			addr.to_vec().try_into().expect("the test's addresses are short; qed");
-		let payload =
-			pallet_bootnodes::pop_payload(&self.jam_genesis_hash, self.para_id, &addr, expiry_slot);
-		Bootnode { addr, node_key: pair.public(), expiry_slot, sig: pair.sign(&payload) }
-	}
+/// The record `set_bootnodes` should publish for the text `addresses`.
+fn record(genesis: [u8; 32], fork_id: &str, addresses: &[&String]) -> BootnodeRecord {
+	let addresses = addresses
+		.iter()
+		.map(|address| {
+			let address: multiaddr::Multiaddr = address.parse().expect("valid; qed");
+			address.to_vec().try_into().expect("the test's addresses are short; qed")
+		})
+		.collect::<Vec<_>>()
+		.try_into()
+		.expect("the test lists few addresses; qed");
+	let fork_id = fork_id.as_bytes().to_vec().try_into().expect("short; qed");
+	BootnodeRecord { genesis, fork_id, addresses }
 }
 
-/// Set the JAM genesis hash on every para with sudo, and return it.
-///
-/// It comes from the genesis header in the JAM chain spec the test wrote, and is checked once
-/// against the hash JAM itself reports for its genesis block.
-async fn set_jam_genesis_hash(jam: &JamNetwork, paras: &[Para]) -> anyhow::Result<H256> {
-	let spec_path = jam.work_dir.join("zombienet/jam_spec.json");
-	let spec: serde_json::Value = serde_json::from_slice(
-		&std::fs::read(&spec_path).with_context(|| format!("reading {}", spec_path.display()))?,
-	)?;
-	let header = spec["genesis_header"].as_str().context("the JAM spec has no genesis_header")?;
-	let header = hex::decode(header.trim_start_matches("0x")).context("genesis_header")?;
-	let hash = H256(sp_crypto_hashing::blake2_256(&header));
-	let reported = H256(jam.jam_rpc.genesis_header_hash().await?);
-	anyhow::ensure!(
-		hash == reported,
-		"the JAM spec's genesis header hashes to {hash:?}, JAM reports genesis {reported:?}",
-	);
-	for para in paras {
-		submit(jam, para, "Bootnodes", "set_jam_genesis_hash", vec![Value::from_bytes(hash)])
-			.await?;
-	}
-	Ok(hash)
+/// The para's genesis hash, as its collator reports it.
+async fn genesis_hash(jam: &JamNetwork, para: &Para) -> anyhow::Result<[u8; 32]> {
+	let name = para.collators.first().context("the para has no collator")?;
+	Ok(jam.collator_client(name).await?.genesis_hash().0)
 }
 
-async fn add_bootnode(jam: &JamNetwork, para: &Para, entry: &Bootnode) -> anyhow::Result<()> {
-	let bootnode = Value::named_composite([
-		("addr", Value::from_bytes(entry.addr.as_slice())),
-		("node_key", Value::from_bytes(entry.node_key)),
-		("expiry_slot", Value::u128(entry.expiry_slot.into())),
-		("sig", Value::from_bytes(entry.sig)),
-	]);
-	submit(jam, para, "Bootnodes", "add_bootnode", vec![bootnode]).await
-}
-
-async fn remove_bootnode(
+async fn set_bootnodes(
 	jam: &JamNetwork,
 	para: &Para,
-	node_key: &ed25519::Public,
+	addresses: &[&String],
+	fork_id: Option<&str>,
 ) -> anyhow::Result<()> {
-	submit(jam, para, "Bootnodes", "remove_bootnode", vec![Value::from_bytes(node_key)]).await
-}
-
-/// Write `value` under the para's `key` with `JamKv::set_kv`, past `pallet-bootnodes`.
-async fn set_kv(jam: &JamNetwork, para: &Para, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
-	let fields = vec![Value::from_bytes(key), Value::from_bytes(value)];
-	submit(jam, para, "JamKv", "set_kv", fields).await
-}
-
-/// Fail if the runtime's address bound is not the one [`Bootnode`] uses.
-async fn check_max_addr_len(jam: &JamNetwork, para: &Para) -> anyhow::Result<()> {
-	let name = para.collators.first().context("the para has no collator")?;
-	let client = jam.collator_client(name).await?;
-	let max_addr_len = client
-		.constants()
-		.at(&zombienet_sdk::subxt::dynamic::constant("Bootnodes", "MaxAddrLen"))?
-		.to_value()?
-		.as_u128();
-	anyhow::ensure!(
-		max_addr_len == Some(MAX_ADDR_LEN.into()),
-		"the runtime's Bootnodes::MaxAddrLen is {max_addr_len:?}, the test uses {MAX_ADDR_LEN}",
-	);
-	Ok(())
+	let addresses = addresses.iter().map(|address| Value::from_bytes(address.as_bytes()));
+	let fork_id = match fork_id {
+		Some(id) => Value::unnamed_variant("Some", [Value::from_bytes(id.as_bytes())]),
+		None => Value::unnamed_variant("None", []),
+	};
+	let fields = vec![Value::unnamed_composite(addresses), fork_id];
+	submit(jam, para, "Bootnodes", "set_bootnodes", fields).await
 }
 
 /// Submit `<pallet>::<call>(fields)` as sudo through the para's first collator.
@@ -410,36 +300,35 @@ async fn submit(
 	Ok(())
 }
 
-/// Poll `serviceValue` at JAM's best block until the service stores exactly `set` under `key`,
-/// or nothing if `set` is empty.
-async fn wait_for_set(jam: &JamNetwork, key: &[u8], set: &[&Bootnode]) -> anyhow::Result<()> {
-	let expected = (!set.is_empty()).then(|| set.encode());
+/// Poll `serviceValue` at JAM's best block until the service stores exactly `record` under `key`,
+/// or nothing if `record` is `None`.
+async fn wait_for_record(
+	jam: &JamNetwork,
+	key: &[u8],
+	record: Option<BootnodeRecord>,
+) -> anyhow::Result<()> {
+	let expected = record.as_ref().map(Encode::encode);
 	let started = Instant::now();
 	loop {
 		let at = jam.jam_rpc.best_block_hash().await?;
 		let stored = jam.jam_rpc.service_value(&at, PARACHAIN_SERVICE_ID, key).await?;
 		if stored == expected {
 			log::info!(
-				"serviceValue({PARACHAIN_SERVICE_ID}, 0x{}) holds {} bootnodes after {:?}",
+				"serviceValue({PARACHAIN_SERVICE_ID}, 0x{}) holds the expected value after {:?}",
 				hex::encode(key),
-				set.len(),
 				started.elapsed(),
 			);
 			return Ok(());
 		}
 		anyhow::ensure!(
 			started.elapsed() < KV_BUDGET,
-			"serviceValue({PARACHAIN_SERVICE_ID}, 0x{}) is {:?} after {KV_BUDGET:?}, expected {} \
-			 bootnodes",
+			"serviceValue({PARACHAIN_SERVICE_ID}, 0x{}) is {:?} after {KV_BUDGET:?}, expected \
+			 {record:?}",
 			hex::encode(key),
-			stored.as_deref().map(decode_set),
-			set.len(),
+			stored
+				.as_deref()
+				.map(|mut value| <BootnodeRecord as codec::Decode>::decode(&mut value)),
 		);
 		tokio::time::sleep(Duration::from_secs(6)).await;
 	}
-}
-
-/// The stored value as a bootnode set, for error messages.
-fn decode_set(mut value: &[u8]) -> Result<Vec<Bootnode>, codec::Error> {
-	codec::Decode::decode(&mut value)
 }

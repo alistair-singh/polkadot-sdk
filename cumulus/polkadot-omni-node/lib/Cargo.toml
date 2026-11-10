@@ -32,6 +32,7 @@ url = { workspace = true }
 # JAM backend (PoC wiring: path deps to the sibling checkouts; the upstream shape
 # is git deps behind a feature or a publish = false shim crate). The two interface
 # crates are this repo's own: parachain-service dropped its copies of them.
+ip_network = { workspace = true }
 jam-interface = { package = "cumulus-jam-interface", path = "../../jam/interface" }
 jam-rpc-interface = { package = "cumulus-jam-rpc-interface", path = "../../jam/rpc-interface" }
 # The parachain-service sibling's consolidated core crate (types, storage keys, service id,

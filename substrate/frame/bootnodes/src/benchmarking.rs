@@ -18,74 +18,18 @@
 //! Benchmarks for `pallet_bootnodes`.
 
 use super::*;
-use alloc::vec;
+use alloc::{format, string::String, vec};
 use frame_benchmarking::v2::*;
-use sp_core::crypto::KeyTypeId;
+use frame_support::traits::EnsureOrigin;
 
-/// Produces node keys and proof-of-possession signatures for benchmarks.
-pub trait BenchmarkHelper {
-	/// Return a fresh ed25519 public key and its signature over `payload`.
-	fn sign(payload: &[u8]) -> (ed25519::Public, ed25519::Signature);
-}
+const PEER: &str = "12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp";
 
-/// Key type under which the default helper keeps benchmark keys in the keystore.
-const BENCH_KEY_TYPE: KeyTypeId = KeyTypeId(*b"boot");
-
-/// Default helper, signing through the keystore the benchmarking host provides.
-impl BenchmarkHelper for () {
-	fn sign(payload: &[u8]) -> (ed25519::Public, ed25519::Signature) {
-		let public = sp_io::crypto::ed25519_generate(BENCH_KEY_TYPE, None);
-		let sig = sp_io::crypto::ed25519_sign(BENCH_KEY_TYPE, &public, payload)
-			.expect("the key was just generated in the keystore; qed");
-		(public, sig)
-	}
-}
-
-fn encode_varint(mut value: usize, out: &mut Vec<u8>) {
-	while value >= 0x80 {
-		out.push((value as u8 & 0x7f) | 0x80);
-		value >>= 7;
-	}
-	out.push(value as u8);
-}
-
-/// The largest `/dns/<label>/tcp/30333` multiaddr of at most `max_len` bytes.
-fn max_multiaddr(max_len: u32) -> Vec<u8> {
-	let max_len = max_len as usize;
-	let mut label_len = max_len.saturating_sub(5);
-	loop {
-		let mut addr = vec![53];
-		encode_varint(label_len, &mut addr);
-		if addr.len() + label_len + 3 <= max_len || label_len == 0 {
-			addr.extend(core::iter::repeat_n(b'a', label_len));
-			addr.extend([6, 0x76, 0x7d]);
-			return addr;
-		}
-		label_len -= 1;
-	}
-}
-
-/// A bootnode with a fresh key and a valid proof of possession over `addr` and `expiry_slot`.
-/// Sets a JAM genesis hash first if there is none.
-fn bootnode<T: Config>(expiry_slot: u32, addr: Vec<u8>) -> Result<BootnodeOf<T>, BenchmarkError> {
-	let addr: BoundedVec<u8, T::MaxAddrLen> =
-		addr.try_into().map_err(|_| BenchmarkError::Stop("MaxAddrLen is too small"))?;
-	if !JamGenesisHash::<T>::exists() {
-		JamGenesisHash::<T>::put(H256::repeat_byte(0x4a));
-	}
-	let payload = Pallet::<T>::pop_payload(&addr, expiry_slot)
-		.ok_or(BenchmarkError::Stop("the JAM genesis hash was just set"))?;
-	let (node_key, sig) = T::BenchmarkHelper::sign(&payload);
-	Ok(Bootnode { addr, node_key, expiry_slot, sig })
-}
-
-/// Fill the set with `n` bootnodes carrying maximum-length addresses.
-fn fill<T: Config>(n: u32) -> Result<(), BenchmarkError> {
-	for _ in 0..n {
-		let bootnode = bootnode::<T>(0, max_multiaddr(T::MaxAddrLen::get()))?;
-		Pallet::<T>::do_add_bootnode(bootnode)?;
-	}
-	Ok(())
+/// The longest text address accepted, distinct for each `index`.
+fn longest_address(index: u32) -> TextMultiAddr {
+	let label = String::from_utf8(vec![b'a'; 63]).expect("ASCII; qed");
+	let last = String::from_utf8(vec![b'a'; 61]).expect("ASCII; qed");
+	let address = format!("/dns/{index:0>63}.{label}.{label}.{last}/tcp/65535/wss/p2p/{PEER}");
+	address.into_bytes().try_into().expect("shorter than MAX_ADDRESS_LEN; qed")
 }
 
 #[benchmarks]
@@ -93,66 +37,33 @@ mod benchmarks {
 	use super::*;
 
 	#[benchmark]
-	fn add_bootnode() -> Result<(), BenchmarkError> {
-		// Worst case: the set is one short of full, so the whole set is read, scanned and written
-		// back with one more maximum-length entry.
-		fill::<T>(T::MaxBootnodes::get().saturating_sub(1))?;
-		let bootnode = bootnode::<T>(1, max_multiaddr(T::MaxAddrLen::get()))?;
+	fn set_bootnodes() -> Result<(), BenchmarkError> {
+		// Worst case: a full list of the longest addresses, each compared with those before it.
+		let addresses: Vec<_> = (0..MAX_BOOTNODES).map(longest_address).collect();
+		let addresses: BoundedVec<_, _> =
+			addresses.try_into().map_err(|_| BenchmarkError::Stop("MAX_BOOTNODES"))?;
+		let fork_id: ForkId = vec![b'a'; MAX_FORK_ID_LEN as usize]
+			.try_into()
+			.map_err(|_| BenchmarkError::Stop("MAX_FORK_ID_LEN"))?;
 		let origin =
-			T::AdminOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
+			T::BootnodesOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
 
 		#[extrinsic_call]
-		_(origin as T::RuntimeOrigin, bootnode.clone());
+		_(origin as T::RuntimeOrigin, addresses, Some(fork_id));
 
-		assert!(Bootnodes::<T>::get().iter().any(|b| b == &bootnode));
 		Ok(())
 	}
 
 	#[benchmark]
-	fn remove_bootnode() -> Result<(), BenchmarkError> {
-		// Worst case: a full set, removing the first entry, which shifts every other one.
-		fill::<T>(T::MaxBootnodes::get())?;
-		let node_key = Bootnodes::<T>::get()
-			.first()
-			.map(|b| b.node_key)
-			.ok_or(BenchmarkError::Stop("MaxBootnodes is zero"))?;
+	fn clear_bootnodes() -> Result<(), BenchmarkError> {
 		let origin =
-			T::AdminOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
+			T::BootnodesOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
 
 		#[extrinsic_call]
-		_(origin as T::RuntimeOrigin, node_key);
+		_(origin as T::RuntimeOrigin);
 
-		assert!(!Bootnodes::<T>::get().iter().any(|b| b.node_key == node_key));
-		Ok(())
-	}
-
-	#[benchmark]
-	fn set_jam_genesis_hash() -> Result<(), BenchmarkError> {
-		let hash = H256::repeat_byte(0x4a);
-		let origin =
-			T::AdminOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)?;
-
-		#[extrinsic_call]
-		_(origin as T::RuntimeOrigin, hash);
-
-		assert_eq!(JamGenesisHash::<T>::get(), Some(hash));
 		Ok(())
 	}
 
 	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn max_multiaddr_is_valid_and_within_one_byte_of_the_bound_for_every_prefix_width() {
-		for max_len in (5..=140).chain(16_380..=16_400).chain([100_000]) {
-			let addr = max_multiaddr(max_len);
-			assert_eq!(multiaddr::validate(&addr), Ok(()), "max_len {max_len}");
-			assert!(addr.len() <= max_len as usize, "max_len {max_len}: {} bytes", addr.len());
-			assert!(addr.len() + 1 >= max_len as usize, "max_len {max_len}: {} bytes", addr.len());
-		}
-	}
 }

@@ -385,46 +385,49 @@ impl pallet_jam_kv::Config for Runtime {
 	type MaxKeyLen = ConstU32<128>;
 	type MaxValueLen = ConstU32<JAM_KV_MAX_VALUE_LEN>;
 	type MaxBytesPerBlock = ConstU32<{ 16 * 1024 }>;
+	type ReservedKeys = JamKvReservedKeys;
+}
+
+/// `pallet-bootnodes` owns `bootnodes/v1`, and is the only check on what is published there.
+#[cfg(jam)]
+pub struct JamKvReservedKeys;
+
+#[cfg(jam)]
+impl frame_support::traits::Contains<frame_support::BoundedVec<u8, ConstU32<128>>>
+	for JamKvReservedKeys
+{
+	fn contains(key: &frame_support::BoundedVec<u8, ConstU32<128>>) -> bool {
+		key.as_slice() == pallet_bootnodes::BOOTNODES_KEY
+	}
 }
 
 /// The largest value the para writes to its key/value storage.
 #[cfg(jam)]
 const JAM_KV_MAX_VALUE_LEN: u32 = 4096;
 
-/// The SpecMsg address record lists at most 4 bootnodes.
+// The largest record fits one key/value entry.
 #[cfg(jam)]
-const MAX_BOOTNODES: u32 = 4;
+const _: () = assert!(pallet_bootnodes::MAX_RECORD_LEN <= JAM_KV_MAX_VALUE_LEN);
 
-/// The longest binary multiaddr a listed bootnode may have.
-#[cfg(jam)]
-const MAX_BOOTNODE_ADDR_LEN: u32 = 128;
-
-// The largest bootnode set fits one key/value entry. Per entry: a 2-byte compact length prefix
-// for the address (up to 16383 bytes), the address, the node key (32), the expiry slot (4) and
-// the signature (64). The set's own prefix is 1 byte below 64 entries.
-#[cfg(jam)]
-const _: () =
-	assert!(1 + MAX_BOOTNODES * (2 + MAX_BOOTNODE_ADDR_LEN + 32 + 4 + 64) <= JAM_KV_MAX_VALUE_LEN);
-
-/// Publishes the bootnode set to the para's key/value storage in the Parachain Service, under
+/// Publishes the bootnode record to the para's key/value storage in the Parachain Service, under
 /// [`pallet_bootnodes::BOOTNODES_KEY`].
 #[cfg(jam)]
 pub struct BootnodesToJamKv;
 
 #[cfg(jam)]
 impl pallet_bootnodes::PublishBootnodes for BootnodesToJamKv {
-	fn publish(set: Option<&[u8]>) -> sp_runtime::DispatchResult {
+	fn publish(record: Option<&[u8]>) -> sp_runtime::DispatchResult {
 		use sp_runtime::DispatchError;
 		let key = pallet_bootnodes::BOOTNODES_KEY
 			.to_vec()
 			.try_into()
 			.map_err(|_| DispatchError::Other("the bootnodes key exceeds MaxKeyLen"))?;
-		match set {
-			Some(set) => {
-				let value = set
+		match record {
+			Some(record) => {
+				let value = record
 					.to_vec()
 					.try_into()
-					.map_err(|_| DispatchError::Other("the bootnode set exceeds MaxValueLen"))?;
+					.map_err(|_| DispatchError::Other("the bootnode record exceeds MaxValueLen"))?;
 				pallet_jam_kv::Pallet::<Runtime>::do_set_kv(key, value)
 			},
 			None => pallet_jam_kv::Pallet::<Runtime>::do_remove_kv(key),
@@ -432,17 +435,10 @@ impl pallet_bootnodes::PublishBootnodes for BootnodesToJamKv {
 	}
 }
 
-/// Root lists the para's bootnodes; every change is published to JAM through `JamKv`. The JAM
-/// genesis hash is not in this para's genesis, which JAM's genesis embeds: root sets it after
-/// launch with `Bootnodes::set_jam_genesis_hash`, and nothing can be listed before.
+/// Root lists the para's bootnodes; every change is published to JAM through `JamKv`.
 #[cfg(jam)]
 impl pallet_bootnodes::Config for Runtime {
-	type AdminOrigin = EnsureRoot<AccountId>;
-	type ParaId = SelfParaIdU32;
-	type MaxBootnodes = ConstU32<MAX_BOOTNODES>;
-	type MaxAddrLen = ConstU32<MAX_BOOTNODE_ADDR_LEN>;
+	type BootnodesOrigin = EnsureRoot<AccountId>;
 	type Publisher = BootnodesToJamKv;
 	type WeightInfo = ();
-	#[cfg(feature = "runtime-benchmarks")]
-	type BenchmarkHelper = ();
 }

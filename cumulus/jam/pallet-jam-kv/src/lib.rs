@@ -53,7 +53,10 @@ pub fn kv_storage_key(para_id: u32, key: &[u8]) -> Vec<u8> {
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
-	use frame_support::{pallet_prelude::*, traits::EnsureOrigin};
+	use frame_support::{
+		pallet_prelude::*,
+		traits::{Contains, EnsureOrigin},
+	};
 	use frame_system::pallet_prelude::*;
 
 	#[pallet::pallet]
@@ -82,6 +85,10 @@ pub mod pallet {
 		/// the service's per-refine budget (`MAX_UPWARD_MESSAGE_BYTES`) for any other sender.
 		#[pallet::constant]
 		type MaxBytesPerBlock: Get<u32>;
+
+		/// Keys `set_kv` and `remove_kv` refuse, because another pallet owns their value and is the
+		/// only check on it. That pallet still writes them through `do_set_kv` and `do_remove_kv`.
+		type ReservedKeys: Contains<BoundedVec<u8, Self::MaxKeyLen>>;
 	}
 
 	/// The encoded upward-message bytes sent in the current block.
@@ -106,6 +113,8 @@ pub mod pallet {
 		EmptyValue,
 		/// The message would exceed [`Config::MaxBytesPerBlock`] for this block.
 		BlockBudgetExhausted,
+		/// The key is one of [`Config::ReservedKeys`].
+		ReservedKey,
 	}
 
 	#[pallet::hooks]
@@ -127,6 +136,7 @@ pub mod pallet {
 			value: BoundedVec<u8, T::MaxValueLen>,
 		) -> DispatchResult {
 			T::AdminOrigin::ensure_origin(origin)?;
+			ensure!(!T::ReservedKeys::contains(&key), Error::<T>::ReservedKey);
 			Self::do_set_kv(key, value)
 		}
 
@@ -138,6 +148,7 @@ pub mod pallet {
 			key: BoundedVec<u8, T::MaxKeyLen>,
 		) -> DispatchResult {
 			T::AdminOrigin::ensure_origin(origin)?;
+			ensure!(!T::ReservedKeys::contains(&key), Error::<T>::ReservedKey);
 			Self::do_remove_kv(key)
 		}
 	}
