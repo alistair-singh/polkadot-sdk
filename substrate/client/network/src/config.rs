@@ -35,7 +35,10 @@ pub use crate::{
 	types::ProtocolName,
 };
 
-pub use litep2p::protocol::libp2p::bitswap::BitswapHandle as Litep2pBitswapHandle;
+pub use litep2p::protocol::libp2p::{
+	bitswap::BitswapHandle as Litep2pBitswapHandle,
+	kademlia::{KademliaEvent as Litep2pKademliaEvent, KademliaHandle as Litep2pKademliaHandle},
+};
 pub use sc_network_types::{build_multiaddr, ed25519};
 use sc_network_types::{
 	multiaddr::{self, Multiaddr},
@@ -830,6 +833,9 @@ pub struct FullNetworkConfiguration<B: BlockT + 'static, H: ExHashT, N: NetworkB
 	/// List of request-response protocols that the node supports.
 	pub(crate) request_response_protocols: Vec<N::RequestResponseProtocolConfig>,
 
+	/// Client-mode Kademlia instances on the DHTs of other chains.
+	pub(crate) client_kademlia: Vec<litep2p::protocol::libp2p::kademlia::Config>,
+
 	/// Network configuration.
 	pub network_config: NetworkConfiguration,
 
@@ -855,6 +861,7 @@ impl<B: BlockT + 'static, H: ExHashT, N: NetworkBackend<B, H>> FullNetworkConfig
 			peer_store_handle,
 			notification_protocols: Vec::new(),
 			request_response_protocols: Vec::new(),
+			client_kademlia: Vec::new(),
 			network_config: network_config.clone(),
 			metrics_registry,
 		}
@@ -873,6 +880,28 @@ impl<B: BlockT + 'static, H: ExHashT, N: NetworkBackend<B, H>> FullNetworkConfig
 	/// Add a request-response protocol.
 	pub fn add_request_response_protocol(&mut self, config: N::RequestResponseProtocolConfig) {
 		self.request_response_protocols.push(config);
+	}
+
+	/// Add a client-mode Kademlia instance on the DHT of the chain with `genesis_hash` and
+	/// `fork_id`. It does not answer queries and is not advertised.
+	///
+	/// Only `Litep2pNetworkBackend` starts these instances.
+	pub fn add_client_kademlia(
+		&mut self,
+		genesis_hash: &[u8],
+		fork_id: Option<&str>,
+	) -> Litep2pKademliaHandle {
+		use litep2p::protocol::libp2p::kademlia::{ConfigBuilder, KademliaMode};
+
+		let (config, handle) = ConfigBuilder::new()
+			.with_protocol_names(vec![crate::litep2p::discovery::kademlia_protocol_name(
+				genesis_hash,
+				fork_id,
+			)])
+			.with_mode(KademliaMode::Client)
+			.build();
+		self.client_kademlia.push(config);
+		handle
 	}
 
 	/// Get handle to [`PeerStore`].

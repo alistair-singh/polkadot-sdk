@@ -94,12 +94,6 @@ pub trait PublishBootnodes {
 	fn publish(record: Option<&[u8]>) -> DispatchResult;
 }
 
-impl PublishBootnodes for () {
-	fn publish(_: Option<&[u8]>) -> DispatchResult {
-		Ok(())
-	}
-}
-
 /// What a para publishes under [`BOOTNODES_KEY`].
 #[derive(Encode, Decode, Clone, PartialEq, Eq, Debug, TypeInfo)]
 pub struct BootnodeRecord {

@@ -64,8 +64,7 @@ polkadot-sdk = { workspace = true, default-features = false, features = [
 cumulus-pallet-parachain-system = { workspace = true }
 # Writes the para's key/value storage in the Parachain Service; wired in only under `cfg(jam)`.
 pallet-jam-kv = { workspace = true }
-# Lists the para's bootnodes and publishes them through `pallet-jam-kv`; wired in only under
-# `cfg(jam)`.
+# Publishes the para's bootnodes through `pallet-jam-kv`; wired in only under `cfg(jam)`.
 pallet-bootnodes = { workspace = true }
 
 # `min_stack_size!`, for the PolkaVM/JAM build (`validate_block` needs more than the 8 KiB default).

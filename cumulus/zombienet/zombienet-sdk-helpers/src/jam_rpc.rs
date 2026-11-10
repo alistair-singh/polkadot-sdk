@@ -159,7 +159,6 @@ impl JamRpc {
 /// Proofs of single state items, in the form the Parachain Service verifies.
 #[cfg(feature = "jam")]
 impl JamRpc {
-
 	/// The posterior state root of block `at`.
 	pub async fn state_root(&self, at: &Value) -> anyhow::Result<[u8; 32]> {
 		let root: AnyHash =

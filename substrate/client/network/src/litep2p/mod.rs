@@ -90,7 +90,7 @@ use std::{
 	time::{Duration, Instant},
 };
 
-mod discovery;
+pub(crate) mod discovery;
 mod ipfs_dht;
 mod peerstore;
 mod service;
@@ -559,6 +559,10 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 					 Only direct Bitswap requests will be handled.",
 				);
 			}
+		}
+
+		for config in std::mem::take(&mut params.network_config.client_kademlia) {
+			config_builder = config_builder.with_libp2p_kademlia(config);
 		}
 
 		config_builder = config_builder

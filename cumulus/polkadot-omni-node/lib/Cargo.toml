@@ -149,7 +149,7 @@ cumulus-primitives-core = { workspace = true, default-features = true }
 cumulus-relay-chain-interface = { workspace = true, default-features = true }
 futures-timer = { workspace = true }
 sc-consensus-aura = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

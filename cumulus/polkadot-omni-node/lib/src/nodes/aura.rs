@@ -595,10 +595,26 @@ where
 			sc_network::config::TransportConfig::Normal { allow_private_ip: true, .. },
 		);
 
-		let net_config = FullNetworkConfiguration::<_, _, sc_network::Litep2pNetworkBackend>::new(
-			&config.network,
-			None,
+		let bootnode_records = jam::bootnodes::records_at_startup(
+			&jam_params.rpc_urls,
+			jam_params.service_id,
+			&jam_params.bootnodes_from,
+			config.tokio_handle.clone(),
 		);
+		let mut net_config =
+			FullNetworkConfiguration::<_, _, sc_network::Litep2pNetworkBackend>::new(
+				&config.network,
+				None,
+			);
+		let mut bootnode_dhts: std::collections::HashMap<_, _> = bootnode_records
+			.into_iter()
+			.map(|(para, record)| {
+				let dht = jam::bootnodes::Dht::open(record, |genesis, fork_id| {
+					net_config.add_client_kademlia(genesis, fork_id)
+				});
+				(para, dht)
+			})
+			.collect();
 
 		let metrics = NotificationMetrics::new(None);
 		let import_queue_service = import_queue.service();
@@ -662,7 +678,6 @@ where
 		};
 
 		let database_path = config.database.path().map(|p| p.to_path_buf());
-		let bootnodes_network = network.clone();
 
 		let _rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
 			network,
@@ -734,7 +749,6 @@ where
 				spawn_essential.spawn_essential("jam-rpc-worker", Some("jam"), Box::pin(worker));
 
 				for &other_para in &jam_params.bootnodes_from {
-					let network = bootnodes_network.clone();
 					spawn.spawn(
 						"jam-bootnodes",
 						Some("jam"),
@@ -743,7 +757,7 @@ where
 							jam_params.service_id,
 							other_para,
 							allow_private_ip,
-							move |peer_id, addr| network.add_known_address(peer_id, addr),
+							bootnode_dhts.remove(&other_para),
 						)),
 					);
 				}

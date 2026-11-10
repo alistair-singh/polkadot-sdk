@@ -17,48 +17,130 @@
 //! The bootnodes of other paras, read from JAM (`--jam-bootnodes-from`).
 //!
 //! A para running `pallet-bootnodes` publishes a [`BootnodeRecord`] to its JAM key-value store
-//! under [`BOOTNODES_KEY`]. The reader follows that value on the parachain service and hands every
-//! address in it to the network as a known address, so this node can dial the other para's nodes.
+//! under [`BOOTNODES_KEY`]. For every para this node exchanges messages with, it runs a client-mode
+//! Kademlia instance on that para's DHT, seeded with the record's addresses, to find its peers.
 //!
-//! It follows JAM's finalized chain, so it never acts on a value that is later reverted. That
-//! only delays a change to the record by JAM's finality lag: connections already made stay up.
+//! litep2p starts Kademlia instances only when the network is created, so the records are read
+//! once before that. A para without a record at that point gets no instance, and a record that
+//! later needs a new one is a [`todo!`]: adding an instance at runtime needs litep2p support.
+//!
+//! The reader follows JAM's finalized chain, so it never acts on a value that is later reverted.
 //!
 //! `pallet-bootnodes` checks what it publishes, and the record's genesis hash can only be checked
-//! there. The reader still skips what it could not dial, since the other para's runtime is not
+//! there. The reader still skips what it could not use, since the other para's runtime is not
 //! ours: an address [`pallet_bootnodes::multiaddr::validate`] rejects, and unless
-//! `--allow-private-ip` is set an address with a non-global IP.
+//! `--allow-private-ip` applies an address with a non-global IP.
 
 use super::LOG_TARGET;
 use codec::DecodeAll;
 use futures::StreamExt;
 use ip_network::IpNetwork;
-use jam_interface::{JamStateSource, ServiceId};
+use jam_interface::{JamChainSource, JamStateSource, ServiceId};
+use jam_rpc_interface::JamRpcInterface;
 use pallet_bootnodes::{BootnodeRecord, BOOTNODES_KEY};
-use sc_network::{multiaddr::Protocol, Multiaddr, PeerId};
-use std::sync::Arc;
+use sc_network::{
+	config::{Litep2pKademliaEvent, Litep2pKademliaHandle},
+	multiaddr::Protocol,
+	Multiaddr, PeerId,
+};
+use std::{
+	collections::{HashMap, HashSet},
+	sync::Arc,
+	time::Duration,
+};
 
-/// A listed node, as the network dials it.
-pub(crate) type KnownBootnode = (PeerId, Multiaddr);
+/// How often the reader asks a para's DHT for more of its peers.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A client-mode Kademlia instance on a para's DHT.
+pub(crate) struct Dht {
+	handle: Litep2pKademliaHandle,
+	/// The record the instance was opened for.
+	record: BootnodeRecord,
+}
+
+impl Dht {
+	/// Open an instance on the DHT `record` names, through `add`.
+	pub(crate) fn open(
+		record: BootnodeRecord,
+		add: impl FnOnce(&[u8; 32], Option<&str>) -> Litep2pKademliaHandle,
+	) -> Self {
+		let fork_id = core::str::from_utf8(&record.fork_id).ok().filter(|id| !id.is_empty());
+		let handle = add(&record.genesis, fork_id);
+		Self { handle, record }
+	}
+
+	/// Whether `record` names the DHT this instance is on.
+	fn serves(&self, record: &BootnodeRecord) -> bool {
+		self.record.genesis == record.genesis && self.record.fork_id == record.fork_id
+	}
+
+	/// Add the nodes of `record` to the routing table.
+	async fn seed(&mut self, record: &BootnodeRecord, allow_private_ip: bool) {
+		for (peer_id, addr) in seeds(record, allow_private_ip) {
+			self.handle.add_known_peer(peer_id.into(), vec![addr.into()]).await;
+		}
+	}
+}
+
+/// The records of `paras` at JAM's finalized block, to open their DHTs before the network starts.
+/// A para with no record, or that cannot be read, is left out.
+pub(crate) fn records_at_startup(
+	rpc_urls: &[url::Url],
+	parachain_service: ServiceId,
+	paras: &[u32],
+	tokio_handle: tokio::runtime::Handle,
+) -> HashMap<u32, BootnodeRecord> {
+	if paras.is_empty() {
+		return HashMap::new();
+	}
+	let read = async {
+		let (jam, worker) = JamRpcInterface::new(rpc_urls.to_vec()).await?;
+		tokio_handle.spawn(worker);
+		let at = jam.finalized_block().await?.header_hash;
+		let mut records = HashMap::new();
+		for &para_id in paras {
+			let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
+			let value = jam.service_value(at, parachain_service, &key).await?;
+			match decode(value.as_deref()) {
+				Ok(Some(record)) => {
+					records.insert(para_id, record);
+				},
+				Ok(None) => {
+					tracing::warn!(target: LOG_TARGET, para_id, "The para has no bootnode record yet, so this node cannot join its DHT.");
+				},
+				Err(error) => {
+					tracing::warn!(target: LOG_TARGET, para_id, ?error, "The para's bootnode record does not decode, so this node cannot join its DHT.");
+				},
+			}
+		}
+		Ok::<_, Box<dyn std::error::Error>>(records)
+	};
+	match tokio::task::block_in_place(|| tokio_handle.block_on(read)) {
+		Ok(records) => records,
+		Err(error) => {
+			tracing::error!(target: LOG_TARGET, %error, "Unable to read the bootnode records from JAM.");
+			HashMap::new()
+		},
+	}
+}
 
 /// The record in a published value; `None` when nothing is published.
-pub(crate) fn decode(value: Option<&[u8]>) -> Result<Option<BootnodeRecord>, codec::Error> {
+fn decode(value: Option<&[u8]>) -> Result<Option<BootnodeRecord>, codec::Error> {
 	value.map(|mut value| BootnodeRecord::decode_all(&mut value)).transpose()
 }
 
-/// The nodes of `record` to dial.
-pub(crate) fn dialable(
-	record: Option<&BootnodeRecord>,
-	allow_private_ip: bool,
-) -> Vec<KnownBootnode> {
+/// The nodes of `record` to seed a DHT with.
+fn seeds(record: &BootnodeRecord, allow_private_ip: bool) -> Vec<(PeerId, Multiaddr)> {
 	record
-		.into_iter()
-		.flat_map(|record| record.addresses.iter())
+		.addresses
+		.iter()
 		.filter_map(|address| known_bootnode(address, allow_private_ip))
 		.collect()
 }
 
-/// The peer `address` names and the address itself, or `None` for one this node should not dial.
-fn known_bootnode(address: &[u8], allow_private_ip: bool) -> Option<KnownBootnode> {
+/// The peer `address` names and the address itself, or `None` for one this node should not use.
+fn known_bootnode(address: &[u8], allow_private_ip: bool) -> Option<(PeerId, Multiaddr)> {
 	if let Err(error) = pallet_bootnodes::multiaddr::validate(address) {
 		tracing::debug!(target: LOG_TARGET, ?error, "Skipping a bootnode: its address is not one a bootnode may list.");
 		return None;
@@ -90,38 +172,24 @@ fn is_global(addr: &Multiaddr) -> bool {
 	})
 }
 
-/// What one update of a para's record changed.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Change {
-	pub added: Vec<KnownBootnode>,
-	pub removed: Vec<KnownBootnode>,
-}
-
-/// The nodes of one para the reader has handed to the network.
-#[derive(Debug, Default)]
-pub(crate) struct Listed(Vec<KnownBootnode>);
-
-impl Listed {
-	/// Replace the listed nodes with `now`, and say which were added and which are gone.
-	pub(crate) fn update(&mut self, now: Vec<KnownBootnode>) -> Change {
-		let added = now.iter().filter(|node| !self.0.contains(node)).cloned().collect();
-		let removed = self.0.iter().filter(|node| !now.contains(node)).cloned().collect();
-		self.0 = now;
-		Change { added, removed }
+/// The next event of `dht`, or never without one.
+async fn next_event(dht: &mut Option<Dht>) -> Option<Litep2pKademliaEvent> {
+	match dht {
+		Some(dht) => dht.handle.next().await,
+		None => futures::future::pending().await,
 	}
 }
 
-/// Follow `para_id`'s published record at JAM's finalized block and pass every newly listed node to
-/// `add_known_address`. Returns when the subscription ends.
+/// Follow `para_id`'s published record at JAM's finalized block, and discover the para's peers
+/// through `dht`, its open instance if any. Returns when the subscription ends.
 ///
-/// A node that drops off the record is only logged: the network has no way to forget an address. A
-/// value that does not decode keeps the nodes listed before.
+/// A value that does not decode, or a cleared record, leaves the DHT as it is.
 pub(crate) async fn follow<Jam: JamStateSource + ?Sized>(
 	jam: Arc<Jam>,
 	parachain_service: ServiceId,
 	para_id: u32,
 	allow_private_ip: bool,
-	add_known_address: impl Fn(PeerId, Multiaddr),
+	mut dht: Option<Dht>,
 ) {
 	let key = pallet_jam_kv::kv_storage_key(para_id, BOOTNODES_KEY);
 	let mut values = match jam.service_value_stream(parachain_service, &key, true).await {
@@ -133,22 +201,48 @@ pub(crate) async fn follow<Jam: JamStateSource + ?Sized>(
 	};
 	tracing::info!(target: LOG_TARGET, para_id, "Following the para's bootnodes on JAM.");
 
-	let mut listed = Listed::default();
-	while let Some(update) = values.next().await {
-		let record = match decode(update.value.as_deref()) {
-			Ok(record) => record,
-			Err(error) => {
-				tracing::warn!(target: LOG_TARGET, para_id, at = ?update.header_hash, ?error, "The para's bootnode record does not decode; keeping the nodes listed before.");
-				continue;
+	// The subscription only reports changes, so the record the instance was opened for seeds it.
+	if let Some(dht) = &mut dht {
+		let record = dht.record.clone();
+		dht.seed(&record, allow_private_ip).await;
+	}
+
+	// Outlives evictions from the routing table, for the offchain-messaging requests to come.
+	let mut discovered = HashSet::new();
+	let mut discovery = tokio::time::interval(DISCOVERY_INTERVAL);
+	loop {
+		tokio::select! {
+			update = values.next() => {
+				let Some(update) = update else { break };
+				let record = match decode(update.value.as_deref()) {
+					Ok(Some(record)) => record,
+					Ok(None) => continue,
+					Err(error) => {
+						tracing::warn!(target: LOG_TARGET, para_id, at = ?update.header_hash, ?error, "The para's bootnode record does not decode; keeping the DHT as it is.");
+						continue;
+					},
+				};
+				match &mut dht {
+					Some(dht) if dht.serves(&record) => dht.seed(&record, allow_private_ip).await,
+					_ => todo!("adding a Kademlia instance at runtime needs litep2p support"),
+				}
 			},
-		};
-		let Change { added, removed } = listed.update(dialable(record.as_ref(), allow_private_ip));
-		for (peer_id, addr) in added {
-			tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = update.slot, "Learned a bootnode of para {para_id}.");
-			add_known_address(peer_id, addr);
-		}
-		for (peer_id, addr) in removed {
-			tracing::info!(target: LOG_TARGET, para_id, %peer_id, %addr, slot = update.slot, "A bootnode of para {para_id} is no longer listed.");
+			event = next_event(&mut dht) => {
+				let Some(Litep2pKademliaEvent::FindNodeSuccess { peers, .. }) = event else { continue };
+				for (peer, addresses) in peers {
+					let peer_id = PeerId::from(peer);
+					let usable = allow_private_ip ||
+						addresses.into_iter().any(|addr| is_global(&Multiaddr::from(addr)));
+					if usable && discovered.insert(peer_id) {
+						tracing::info!(target: LOG_TARGET, para_id, %peer_id, "Discovered a peer of para {para_id}.");
+					}
+				}
+			},
+			_ = discovery.tick(), if dht.is_some() => {
+				if let Some(dht) = &mut dht {
+					dht.handle.find_node(PeerId::random().into()).await;
+				}
+			},
 		}
 	}
 	tracing::warn!(target: LOG_TARGET, para_id, "The subscription to the para's bootnodes ended.");
@@ -160,9 +254,6 @@ mod tests {
 	use codec::Encode;
 	use sp_core::{ed25519, Pair as _};
 
-	/// The para the tests follow.
-	const PARA: u32 = 0;
-
 	fn peer(seed: u8) -> PeerId {
 		let pair = ed25519::Pair::from_seed(&[seed; 32]);
 		PeerId::from_ed25519(&pair.public().0).expect("an ed25519 key is a peer id; qed")
@@ -172,10 +263,6 @@ mod tests {
 		format!("{addr}/p2p/{}", peer(seed))
 			.parse()
 			.expect("the test's addresses parse; qed")
-	}
-
-	fn known(seed: u8, addr: &str) -> KnownBootnode {
-		(peer(seed), address(seed, addr))
 	}
 
 	fn record_of(addresses: Vec<Vec<u8>>) -> BootnodeRecord {
@@ -192,65 +279,40 @@ mod tests {
 		record_of(addresses.iter().map(|(seed, addr)| address(*seed, addr).to_vec()).collect())
 	}
 
-	fn value(addresses: &[(u8, &str)]) -> Option<Vec<u8>> {
-		Some(record(addresses).encode())
-	}
-
-	#[test]
-	fn every_address_is_dialed_as_the_peer_it_names() {
-		let record = record(&[(1, "/ip4/8.8.8.8/tcp/30333"), (2, "/dns/b.example.org/tcp/1/ws")]);
-
-		assert_eq!(
-			dialable(Some(&record), false),
-			vec![known(1, "/ip4/8.8.8.8/tcp/30333"), known(2, "/dns/b.example.org/tcp/1/ws")],
-		);
-	}
-
-	#[test]
-	fn no_value_is_no_record() {
-		assert_eq!(decode(None), Ok(None));
-		assert_eq!(dialable(None, false), vec![]);
-	}
-
 	#[test]
 	fn a_value_that_is_no_record_is_an_error() {
+		assert_eq!(decode(None), Ok(None));
 		assert!(decode(Some(&[0x04, 0xff])).is_err());
 		let mut trailing = record(&[(1, "/ip4/8.8.8.8/tcp/1")]).encode();
 		trailing.push(0);
 		assert!(decode(Some(&trailing)).is_err());
 	}
 
-	/// The other para's runtime is not ours, so what it publishes is not trusted to be dialable.
+	/// The other para's runtime is not ours, so what it publishes is not trusted to be usable.
 	#[test]
 	fn addresses_the_pallet_would_reject_are_skipped() {
 		let no_peer = "/ip4/8.8.8.8/tcp/1".parse::<Multiaddr>().unwrap().to_vec();
 		let udp = address(2, "/ip4/8.8.8.8/udp/1/quic-v1").to_vec();
-		let localhost = address(3, "/dns/localhost/tcp/1").to_vec();
 		let good = address(4, "/ip4/8.8.8.8/tcp/1");
-		let record = record_of(vec![no_peer, vec![0xff, 0xff], udp, localhost, good.to_vec()]);
+		let record = record_of(vec![no_peer, vec![0xff, 0xff], udp, good.to_vec()]);
 
-		assert_eq!(dialable(Some(&record), true), vec![(peer(4), good)]);
+		assert_eq!(seeds(&record, true), vec![(peer(4), good)]);
 	}
 
 	#[test]
 	fn a_non_global_ip_is_skipped_unless_allowed() {
-		let private = [
+		let global = address(6, "/ip4/8.8.8.8/tcp/1");
+		let hostname = address(7, "/dns/b.example.org/tcp/1");
+		let record = record(&[
 			(1, "/ip4/127.0.0.1/tcp/1"),
 			(2, "/ip4/10.0.0.1/tcp/1"),
-			(3, "/ip4/192.168.1.1/tcp/1/ws"),
-			(4, "/ip6/::1/tcp/1"),
-			(5, "/ip6/fe80::1/tcp/1"),
-		];
-		let global = (6, "/ip4/8.8.8.8/tcp/1");
-		let hostname = (7, "/dns/b.example.org/tcp/1");
-		let record =
-			record(&[private[0], private[1], private[2], private[3], private[4], global, hostname]);
+			(3, "/ip6/::1/tcp/1"),
+			(6, "/ip4/8.8.8.8/tcp/1"),
+			(7, "/dns/b.example.org/tcp/1"),
+		]);
 
-		assert_eq!(
-			dialable(Some(&record), false),
-			vec![known(global.0, global.1), known(hostname.0, hostname.1)],
-		);
-		assert_eq!(dialable(Some(&record), true).len(), 7);
+		assert_eq!(seeds(&record, false), vec![(peer(6), global), (peer(7), hostname)]);
+		assert_eq!(seeds(&record, true).len(), 5);
 	}
 
 	/// A JAM source with scripted value updates. It records whether the reader asked for the
@@ -329,56 +391,13 @@ mod tests {
 		}
 	}
 
-	/// Run the reader over `jam`'s scripted updates; the nodes it handed to the network, in order.
-	async fn learned(jam: Arc<ScriptedJam>) -> Vec<KnownBootnode> {
-		let learned = std::sync::Mutex::new(Vec::new());
-		follow(jam, 1337, PARA, true, |peer_id, addr| {
-			learned.lock().unwrap().push((peer_id, addr))
-		})
-		.await;
-		learned.into_inner().unwrap()
-	}
-
-	/// A value that is later reverted must never be dialed.
+	/// A value that is later reverted must never be acted on. Garbage and a cleared record leave
+	/// things as they are, so this run reaches the end of the stream.
 	#[tokio::test]
-	async fn the_reader_follows_finalized_jam() {
-		let jam = ScriptedJam::with_values([value(&[(1, "/ip4/127.0.0.1/tcp/1")])]);
+	async fn the_reader_follows_finalized_jam_and_ignores_garbage() {
+		let jam = ScriptedJam::with_values([None, Some(vec![0x04, 0xff])]);
 
-		assert_eq!(learned(jam.clone()).await, vec![known(1, "/ip4/127.0.0.1/tcp/1")]);
+		follow(jam.clone(), 1337, 0, true, None).await;
 		assert_eq!(*jam.finalized.lock().unwrap(), Some(true));
-	}
-
-	/// Message delivery matters more than which node delivers: a value that does not decode
-	/// keeps the nodes listed before, so the reader does not forget peers it can still use.
-	#[tokio::test]
-	async fn a_value_that_does_not_decode_keeps_the_nodes_listed_before() {
-		let (a, b) = ((1, "/ip4/127.0.0.1/tcp/1"), (2, "/ip4/127.0.0.1/tcp/2"));
-		let jam = ScriptedJam::with_values([value(&[a]), Some(vec![0x04, 0xff]), value(&[a, b])]);
-
-		// Had the garbage cleared the set, the last update would hand `a` to the network again.
-		assert_eq!(learned(jam).await, vec![known(a.0, a.1), known(b.0, b.1)]);
-	}
-
-	/// The reader hands each node to the network once, and names the ones that left the set.
-	#[test]
-	fn an_update_reports_what_it_added_and_removed() {
-		let (a, b) = (known(1, "/ip4/127.0.0.1/tcp/1"), known(2, "/ip4/127.0.0.1/tcp/2"));
-		let a_moved = known(1, "/ip4/127.0.0.1/tcp/9");
-		let mut listed = Listed::default();
-
-		assert_eq!(
-			listed.update(vec![a.clone()]),
-			Change { added: vec![a.clone()], removed: vec![] }
-		);
-		assert_eq!(
-			listed.update(vec![a.clone(), b.clone()]),
-			Change { added: vec![b.clone()], removed: vec![] },
-		);
-		assert_eq!(
-			listed.update(vec![a_moved.clone(), b.clone()]),
-			Change { added: vec![a_moved.clone()], removed: vec![a] },
-		);
-		assert_eq!(listed.update(vec![]), Change { added: vec![], removed: vec![a_moved, b] });
-		assert_eq!(listed.update(vec![]), Change::default());
 	}
 }

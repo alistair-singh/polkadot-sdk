@@ -435,7 +435,7 @@ impl pallet_bootnodes::PublishBootnodes for BootnodesToJamKv {
 	}
 }
 
-/// Root lists the para's bootnodes; every change is published to JAM through `JamKv`.
+/// Root sets the para's bootnodes, published to JAM through `JamKv`.
 #[cfg(jam)]
 impl pallet_bootnodes::Config for Runtime {
 	type BootnodesOrigin = EnsureRoot<AccountId>;

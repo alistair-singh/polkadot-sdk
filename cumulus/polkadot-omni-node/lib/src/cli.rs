@@ -214,10 +214,9 @@ pub struct Cli<Config: CliConfig> {
 	#[arg(long, value_name = "URL", num_args = 1..)]
 	pub jam_recovery_rpc_urls: Vec<url::Url>,
 
-	/// EXPERIMENTAL (JAM): Learn the bootnodes another para publishes to JAM.
+	/// EXPERIMENTAL (JAM): Join the DHT of another para through the bootnodes it publishes to JAM.
 	///
-	/// The node follows the set the para's `pallet-bootnodes` publishes and adds every listed
-	/// node as a known address. Repeat the flag for more paras. The entries are not checked yet.
+	/// The para must have a record on JAM when this node starts. Repeat the flag for more paras.
 	#[arg(long, value_name = "PARA_ID")]
 	pub jam_bootnodes_from: Vec<u32>,
 
@@ -324,7 +323,7 @@ pub struct JamNodeParams {
 	pub authorizer_blob: PathBuf,
 	/// Length of a parachain slot in JAM timeslots.
 	pub slot_duration: u32,
-	/// The paras whose published bootnodes this node learns.
+	/// The paras whose DHTs this node joins through their published bootnodes.
 	pub bootnodes_from: Vec<u32>,
 }
 

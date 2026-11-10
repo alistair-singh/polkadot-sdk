@@ -22,12 +22,10 @@
 //! record with sudo, and after each change waits for `serviceValue` on the Parachain Service to
 //! hold exactly the expected record, including the para's real genesis hash.
 //!
-//! A second test runs two paras. Para B's collator follows para A's record (`--jam-bootnodes-from`)
-//! and, once A lists its collator `alpha`, dials it. The two run different chains, so `alpha`
-//! refuses B's sync protocol; the connection itself is what shows B found A through JAM: B has
-//! no other way to learn `alpha`'s address, and the handshake checks the peer id. `alpha` is
-//! listed at a dead port first and then moved, so the connection also shows the reader follows a
-//! replaced address.
+//! A second test runs two paras. Para A lists only its collator `alpha`. Para B's collator
+//! follows A's record (`--jam-bootnodes-from`), joins A's DHT through `alpha` and from there finds
+//! `beta`, which no record names. Kademlia instances only start with the network, so `gamma` is
+//! paused while the record is written and restarted once it is finalized.
 
 use anyhow::Context;
 use codec::Encode;
@@ -57,6 +55,9 @@ const FINALIZED: u64 = 2;
 
 /// Budget for a change to reach JAM: inclusion, refine, availability and accumulation.
 const KV_BUDGET: Duration = Duration::from_secs(4 * 60);
+
+/// Budget for a node to connect to a para's bootnode and find its peers.
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(2 * 60);
 
 /// Budget for a sudo call to land in a best block of the collator it was submitted to.
 const SUBMIT_BUDGET: Duration = Duration::from_secs(2 * 60);
@@ -91,19 +92,29 @@ async fn bootnodes_are_published_to_jam() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> {
+async fn another_para_finds_peers_through_the_listed_bootnode() -> Result<(), anyhow::Error> {
 	let (a, b) = (Para::new(0, 0, &["alpha", "beta"]), Para::new(1, 1, &["gamma"]));
-	let (alpha_port, beta_port) = (free_port()?, free_port()?);
+	let alpha_port = free_port()?;
 	let mut options = SpawnOptions::new(TINY_CORES);
+	// The spec is a `Live` chain, so without this para 0's nodes keep each other's loopback
+	// addresses out of their DHT, and alpha has no peer to tell gamma about.
+	let discover_local = || vec!["--discover-local".into()];
 	options.collators = HashMap::from([
-		("alpha".to_string(), CollatorOptions { p2p_port: Some(alpha_port), ..Default::default() }),
-		("beta".to_string(), CollatorOptions { p2p_port: Some(beta_port), ..Default::default() }),
+		(
+			"alpha".to_string(),
+			CollatorOptions {
+				p2p_port: Some(alpha_port),
+				args: discover_local(),
+				..Default::default()
+			},
+		),
+		("beta".to_string(), CollatorOptions { args: discover_local(), ..Default::default() }),
 		(
 			"gamma".to_string(),
 			CollatorOptions {
 				args: vec![
 					("--jam-bootnodes-from", a.id.to_string().as_str()).into(),
-					// The connection this test waits for is only logged at trace.
+					// The connections this test waits for are only logged at trace.
 					"-llitep2p::transport-manager=trace".into(),
 				],
 				..Default::default()
@@ -111,54 +122,34 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 		),
 	]);
 	let paras = [a.clone(), b];
-	let jam = spawn("another_para_dials_the_listed_bootnodes", &paras, options).await?;
+	let jam =
+		spawn("another_para_finds_peers_through_the_listed_bootnode", &paras, options).await?;
 	let result = async {
 		wait_for_collators(&jam.network, &paras, BLOCKS, FINALIZED, DEADLINE.as_secs()).await?;
 		let genesis = genesis_hash(&jam, &a).await?;
-		wait_for_log(&jam, "gamma", &["Following the para's bootnodes on JAM."]).await?;
-
 		let (alpha, beta) = (network_key("alpha"), network_key("beta"));
 		let (alpha_peer, beta_peer) = (peer_id(&alpha), peer_id(&beta));
+
+		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
+		let alpha_addr = format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws");
+		let listed = address(&alpha, &alpha_addr);
+		let gamma = jam.network.get_node("gamma")?;
+		gamma.pause().await?;
+		set_bootnodes(&jam, &a, &[&listed], None).await?;
+		let key = kv_storage_key(a.id, BOOTNODES_KEY);
+		let expected = record(genesis, "", &[&listed]);
+		wait_for_record(&jam, &key, Some(expected)).await?;
 		for peer in [&alpha_peer, &beta_peer] {
 			anyhow::ensure!(
-				connections_to(&jam, "gamma", peer).await?.is_empty(),
-				"gamma reached {peer} before para 0 listed it",
+				log_lines_with(&jam, "gamma", &[CONNECTED, peer]).await?.is_empty(),
+				"gamma reached {peer} before joining para 0's DHT",
 			);
 		}
+		gamma.restart(None).await?;
 
-		// `alpha` is listed first at a port nothing listens on, then moved to its own: the
-		// reader passes the new address on, and `gamma` dials `alpha` there.
-		// zombienet's nodes listen on WebSocket only (`--listen-addr .../ws`).
-		let key = kv_storage_key(a.id, BOOTNODES_KEY);
-		let stale_addr = format!("/ip4/127.0.0.1/tcp/{}/ws", free_port()?);
-		let stale = address(&alpha, &stale_addr);
-		set_bootnodes(&jam, &a, &[&stale], None).await?;
-		wait_for_record(&jam, &key, Some(record(genesis, "", &[&stale]))).await?;
-		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &stale_addr]).await?;
-
-		let alpha_addr = format!("/ip4/127.0.0.1/tcp/{alpha_port}/ws");
-		let moved = address(&alpha, &alpha_addr);
-		set_bootnodes(&jam, &a, &[&moved], None).await?;
-		wait_for_record(&jam, &key, Some(record(genesis, "", &[&moved]))).await?;
-		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &alpha_addr]).await?;
-		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &stale_addr])
-			.await?;
-		wait_for_connection(&jam, "gamma", &alpha_peer, &alpha_addr).await?;
-
-		// The list is replaced as a whole: `beta` comes in and `alpha` drops off.
-		let beta_addr = format!("/ip4/127.0.0.1/tcp/{beta_port}/ws");
-		let beta_address = address(&beta, &beta_addr);
-		set_bootnodes(&jam, &a, &[&beta_address], None).await?;
-		wait_for_record(&jam, &key, Some(record(genesis, "", &[&beta_address]))).await?;
-		wait_for_log(&jam, "gamma", &["Learned a bootnode of para 0.", &beta_peer]).await?;
-		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &alpha_peer])
-			.await?;
-		wait_for_connection(&jam, "gamma", &beta_peer, &beta_addr).await?;
-
-		submit(&jam, &a, "Bootnodes", "clear_bootnodes", vec![]).await?;
-		wait_for_record(&jam, &key, None).await?;
-		wait_for_log(&jam, "gamma", &["A bootnode of para 0 is no longer listed.", &beta_peer])
-			.await
+		let dialed = format!("endpoint=Dialer {{ address: {alpha_addr}/p2p/{alpha_peer}");
+		wait_for_log(&jam, "gamma", &[CONNECTED, &dialed]).await?;
+		wait_for_log(&jam, "gamma", &["Discovered a peer of para 0.", &beta_peer]).await
 	}
 	.await;
 
@@ -166,34 +157,12 @@ async fn another_para_dials_the_listed_bootnodes() -> Result<(), anyhow::Error> 
 	result
 }
 
-/// How long a node may take to dial a peer it just learned: its peerset fills free slots every
-/// second or so.
-const DIAL_BUDGET: Duration = Duration::from_secs(60);
+/// What litep2p logs at trace level for an established connection.
+const CONNECTED: &str = "on connection established completed";
 
 /// The network key zombienet derives from a node's name.
 fn network_key(name: &str) -> ed25519::Pair {
 	ed25519::Pair::from_seed(&sp_crypto_hashing::sha2_256(name.as_bytes()))
-}
-
-/// Poll `name`'s log until litep2p established a connection it dialed to `peer` at `addr`.
-async fn wait_for_connection(
-	jam: &JamNetwork,
-	name: &str,
-	peer: &str,
-	addr: &str,
-) -> anyhow::Result<()> {
-	let dialed = format!("endpoint=Dialer {{ address: {addr}/p2p/{peer}");
-	let needles = ["on connection established completed", dialed.as_str()];
-	let started = Instant::now();
-	while log_lines_with(jam, name, &needles).await?.is_empty() {
-		anyhow::ensure!(
-			started.elapsed() < DIAL_BUDGET,
-			"{name} never connected to {peer} at {addr}",
-		);
-		tokio::time::sleep(Duration::from_secs(2)).await;
-	}
-	log::info!("{name} connected to {peer} at {addr} after {:?}", started.elapsed());
-	Ok(())
 }
 
 /// The base58 peer id of the node whose network key is `pair`.
@@ -201,11 +170,6 @@ fn peer_id(pair: &ed25519::Pair) -> String {
 	sc_network_types::PeerId::from_ed25519(&pair.public().0)
 		.expect("an ed25519 key is a peer id; qed")
 		.to_base58()
-}
-
-/// The lines of `name`'s log where litep2p established a connection with `peer`.
-async fn connections_to(jam: &JamNetwork, name: &str, peer: &str) -> anyhow::Result<Vec<String>> {
-	log_lines_with(jam, name, &["on connection established completed", peer]).await
 }
 
 /// The lines of `name`'s log that carry every one of `needles`.
@@ -227,8 +191,8 @@ async fn wait_for_log(jam: &JamNetwork, name: &str, needles: &[&str]) -> anyhow:
 	let started = Instant::now();
 	while log_lines_with(jam, name, needles).await?.is_empty() {
 		anyhow::ensure!(
-			started.elapsed() < KV_BUDGET,
-			"no line of {name}'s log carries {needles:?} after {KV_BUDGET:?}",
+			started.elapsed() < DISCOVERY_BUDGET,
+			"no line of {name}'s log carries {needles:?} after {DISCOVERY_BUDGET:?}",
 		);
 		tokio::time::sleep(Duration::from_secs(2)).await;
 	}
@@ -300,8 +264,8 @@ async fn submit(
 	Ok(())
 }
 
-/// Poll `serviceValue` at JAM's best block until the service stores exactly `record` under `key`,
-/// or nothing if `record` is `None`.
+/// Poll `serviceValue` at JAM's finalized block, which the reader follows, until the service stores
+/// exactly `record` under `key`, or nothing if `record` is `None`.
 async fn wait_for_record(
 	jam: &JamNetwork,
 	key: &[u8],
@@ -310,7 +274,7 @@ async fn wait_for_record(
 	let expected = record.as_ref().map(Encode::encode);
 	let started = Instant::now();
 	loop {
-		let at = jam.jam_rpc.best_block_hash().await?;
+		let at = jam.jam_rpc.finalized_header_hash().await?;
 		let stored = jam.jam_rpc.service_value(&at, PARACHAIN_SERVICE_ID, key).await?;
 		if stored == expected {
 			log::info!(
