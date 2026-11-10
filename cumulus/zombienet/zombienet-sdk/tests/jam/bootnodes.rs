@@ -24,8 +24,8 @@
 //!
 //! A second test runs two paras. Para A lists only its collator `alpha`. Para B's collator
 //! follows A's record (`--jam-bootnodes-from`), joins A's DHT through `alpha` and from there finds
-//! `beta`, which no record names. Kademlia instances only start with the network, so `gamma` is
-//! paused while the record is written and restarted once it is finalized.
+//! and connects to `beta`, which no record names. Kademlia instances only start with the network,
+//! so `gamma` is paused while the record is written and restarted once it is finalized.
 
 use anyhow::Context;
 use codec::Encode;
@@ -149,7 +149,9 @@ async fn another_para_finds_peers_through_the_listed_bootnode() -> Result<(), an
 
 		let dialed = format!("endpoint=Dialer {{ address: {alpha_addr}/p2p/{alpha_peer}");
 		wait_for_log(&jam, "gamma", &[CONNECTED, &dialed]).await?;
-		wait_for_log(&jam, "gamma", &["Discovered a peer of para 0.", &beta_peer]).await
+		wait_for_log(&jam, "gamma", &["Discovered a peer of para 0.", &beta_peer]).await?;
+		// The lookup that found beta also queried it, so gamma dialled it too.
+		wait_for_log(&jam, "gamma", &[CONNECTED, "endpoint=Dialer", &beta_peer]).await
 	}
 	.await;
 
