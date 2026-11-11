@@ -11392,6 +11392,7 @@ dependencies = [
 [[package]]
 name = "litep2p"
 version = "0.17.0"
+source = "git+https://github.com/alistair-singh/litep2p?rev=2070f4bc93ad6189cbca0362d0330f55da155361#2070f4bc93ad6189cbca0362d0330f55da155361"
 dependencies = [
  "async-trait",
  "bs58",
@@ -20394,7 +20395,7 @@ dependencies = [
  "libc",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -21764,7 +21765,7 @@ dependencies = [
  "security-framework 3.5.1",
  "security-framework-sys",
  "webpki-root-certs 1.0.3",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -25651,7 +25652,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
