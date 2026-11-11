@@ -17,6 +17,7 @@
 
 #![cfg(feature = "jam")]
 
+mod bootnodes;
 mod collator_progress;
 mod core_assignment;
 mod demo;

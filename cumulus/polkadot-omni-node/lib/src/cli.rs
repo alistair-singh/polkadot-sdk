@@ -214,6 +214,12 @@ pub struct Cli<Config: CliConfig> {
 	#[arg(long, value_name = "URL", num_args = 1..)]
 	pub jam_recovery_rpc_urls: Vec<url::Url>,
 
+	/// EXPERIMENTAL (JAM): Join the DHT of another para through the bootnodes it publishes to JAM.
+	///
+	/// The para must have a record on JAM when this node starts. Repeat the flag for more paras.
+	#[arg(long, value_name = "PARA_ID")]
+	pub jam_bootnodes_from: Vec<u32>,
+
 	/// DEPRECATED: This feature has been stabilized, pLease use `--authoring slot-based` instead.
 	///
 	/// Use slot-based collator which can handle elastic scaling.
@@ -317,6 +323,8 @@ pub struct JamNodeParams {
 	pub authorizer_blob: PathBuf,
 	/// Length of a parachain slot in JAM timeslots.
 	pub slot_duration: u32,
+	/// The paras whose DHTs this node joins through their published bootnodes.
+	pub bootnodes_from: Vec<u32>,
 }
 
 /// Development sealing mode.
@@ -398,6 +406,7 @@ impl<Config: CliConfig> Cli<Config> {
 			service_id,
 			authorizer_blob,
 			slot_duration: self.jam_slot_duration,
+			bootnodes_from: self.jam_bootnodes_from.clone(),
 		}))
 	}
 

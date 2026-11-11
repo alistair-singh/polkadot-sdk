@@ -398,6 +398,10 @@ pub use pallet_beefy;
 #[cfg(feature = "pallet-beefy-mmr")]
 pub use pallet_beefy_mmr;
 
+/// FRAME pallet maintaining a parachain's bootnode set.
+#[cfg(feature = "pallet-bootnodes")]
+pub use pallet_bootnodes;
+
 /// FRAME pallet to manage bounties.
 #[cfg(feature = "pallet-bounties")]
 pub use pallet_bounties;

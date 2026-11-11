@@ -36,6 +36,18 @@ impl pallet_jam_kv::Config for Test {
 	type MaxKeyLen = frame_support::traits::ConstU32<16>;
 	type MaxValueLen = frame_support::traits::ConstU32<32>;
 	type MaxBytesPerBlock = MaxBytesPerBlock;
+	type ReservedKeys = OnlyReserved;
+}
+
+/// Reserves the key `reserved`.
+pub struct OnlyReserved;
+
+impl frame_support::traits::Contains<BoundedVec<u8, frame_support::traits::ConstU32<16>>>
+	for OnlyReserved
+{
+	fn contains(key: &BoundedVec<u8, frame_support::traits::ConstU32<16>>) -> bool {
+		key.as_slice() == b"reserved"
+	}
 }
 
 fn new_test_ext() -> sp_io::TestExternalities {
@@ -124,5 +136,23 @@ fn block_budget_resets_works() {
 		assert_ok!(JamKv::set_kv(RuntimeOrigin::root(), bounded(&[1; 16]), bounded(&value)));
 		<JamKv as frame_support::traits::Hooks<u64>>::on_initialize(2);
 		assert_ok!(JamKv::set_kv(RuntimeOrigin::root(), bounded(&[2; 16]), bounded(&value)));
+	});
+}
+
+#[test]
+fn the_calls_refuse_a_reserved_key_but_its_owner_can_write_it() {
+	new_test_ext().execute_with(|| {
+		let key = || bounded(b"reserved");
+		frame_support::assert_noop!(
+			JamKv::set_kv(RuntimeOrigin::root(), key(), bounded(b"value")),
+			Error::<Test>::ReservedKey
+		);
+		frame_support::assert_noop!(
+			JamKv::remove_kv(RuntimeOrigin::root(), key()),
+			Error::<Test>::ReservedKey
+		);
+
+		frame_support::assert_ok!(JamKv::do_set_kv(key(), bounded(b"value")));
+		frame_support::assert_ok!(JamKv::do_remove_kv(key()));
 	});
 }

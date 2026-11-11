@@ -264,7 +264,7 @@ fn legacy_kademlia_protocol_name(id: &ProtocolId) -> ProtocolName {
 }
 
 /// Kademlia protocol name based on `genesis_hash` and `fork_id`.
-fn kademlia_protocol_name<Hash: AsRef<[u8]>>(
+pub(crate) fn kademlia_protocol_name<Hash: AsRef<[u8]>>(
 	genesis_hash: Hash,
 	fork_id: Option<&str>,
 ) -> ProtocolName {
@@ -645,6 +645,13 @@ impl Stream for Discovery {
 			},
 			Poll::Ready(Some(KademliaEvent::RoutingTableUpdate { peers })) => {
 				log::trace!(target: LOG_TARGET, "routing table update, discovered {} peers", peers.len());
+
+				return Poll::Ready(Some(DiscoveryEvent::RoutingTableUpdate {
+					peers: peers.into_iter().collect(),
+				}));
+			},
+			Poll::Ready(Some(KademliaEvent::PeersDiscovered { peers })) => {
+				log::trace!(target: LOG_TARGET, "discovered {} peers", peers.len());
 
 				return Poll::Ready(Some(DiscoveryEvent::RoutingTableUpdate {
 					peers: peers.into_iter().collect(),
