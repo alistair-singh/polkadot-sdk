@@ -590,11 +590,17 @@ where
 		);
 
 		let is_authority = config.role.is_authority();
-
-		let net_config = FullNetworkConfiguration::<_, _, sc_network::Litep2pNetworkBackend>::new(
-			&config.network,
-			None,
+		let allow_private_ip = matches!(
+			config.network.transport,
+			sc_network::config::TransportConfig::Normal { allow_private_ip: true, .. },
 		);
+
+		let mut net_config =
+			FullNetworkConfiguration::<_, _, sc_network::Litep2pNetworkBackend>::new(
+				&config.network,
+				None,
+			);
+		let client_kademlia = net_config.client_kademlia();
 
 		let metrics = NotificationMetrics::new(None);
 		let import_queue_service = import_queue.service();
@@ -710,6 +716,7 @@ where
 			let para_backend = backend.clone();
 			let keystore = keystore_container.keystore();
 			let spawn_essential = task_manager.spawn_essential_handle();
+			let spawn = task_manager.spawn_handle();
 			let announce_block = announce_block.clone();
 			let block_import = block_import.clone();
 			async move {
@@ -726,6 +733,20 @@ where
 				};
 				let jam = Arc::new(jam);
 				spawn_essential.spawn_essential("jam-rpc-worker", Some("jam"), Box::pin(worker));
+
+				for &other_para in &jam_params.bootnodes_from {
+					spawn.spawn(
+						"jam-bootnodes",
+						Some("jam"),
+						Box::pin(jam::bootnodes::follow(
+							jam.clone(),
+							jam_params.service_id,
+							other_para,
+							allow_private_ip,
+							client_kademlia.clone(),
+						)),
+					);
+				}
 
 				let best_heads = match jam::para_header_stream::<Block, _>(
 					&*jam,

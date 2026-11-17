@@ -32,6 +32,7 @@ url = { workspace = true }
 # JAM backend (PoC wiring: path deps to the sibling checkouts; the upstream shape
 # is git deps behind a feature or a publish = false shim crate). The two interface
 # crates are this repo's own: parachain-service dropped its copies of them.
+ip_network = { workspace = true }
 jam-interface = { package = "cumulus-jam-interface", path = "../../jam/interface" }
 jam-rpc-interface = { package = "cumulus-jam-rpc-interface", path = "../../jam/rpc-interface" }
 # The parachain-service sibling's consolidated core crate (types, storage keys, service id,
@@ -44,6 +45,9 @@ parachain-authorizer = { path = "../../../../parachain-service/authorizer", feat
 parachain-authorizer-ed25519 = { path = "../../../../parachain-service/authorizer-ed25519" }
 parachain-authorizer-sr25519 = { path = "../../../../parachain-service/authorizer-sr25519" }
 parachain-service-core = { path = "../../../../parachain-service/core", features = ["std"] }
+# The bootnode record other paras publish to JAM, and the key-value key it sits under.
+pallet-bootnodes = { workspace = true, default-features = true }
+pallet-jam-kv = { workspace = true, default-features = true }
 
 # Local
 frame-metadata = { workspace = true, default-features = true }
@@ -145,7 +149,7 @@ cumulus-primitives-core = { workspace = true, default-features = true }
 cumulus-relay-chain-interface = { workspace = true, default-features = true }
 futures-timer = { workspace = true }
 sc-consensus-aura = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
