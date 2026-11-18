@@ -11392,7 +11392,7 @@ dependencies = [
 [[package]]
 name = "litep2p"
 version = "0.17.0"
-source = "git+https://github.com/alistair-singh/litep2p?rev=a25234e1ff8c8406bd3534fe4e16e53e985711b8#a25234e1ff8c8406bd3534fe4e16e53e985711b8"
+source = "git+https://github.com/alistair-singh/litep2p?rev=edcd0cd51a48c25433c4678cd63a146114d56a0f#edcd0cd51a48c25433c4678cd63a146114d56a0f"
 dependencies = [
  "async-trait",
  "bs58",
