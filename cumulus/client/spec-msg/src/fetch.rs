@@ -24,8 +24,8 @@ use codec::{DecodeLimit, Encode, MaxEncodedLen};
 use cumulus_primitives_core::ParaId;
 use cumulus_primitives_spec_messaging::{
 	verify_channel_messages, verify_messages, FetchError, FetchResponse, MessagePosition,
-	MessagesRequest, MessagesResponse, MmrFrontier, Register, StreamId, StreamProof, StreamsRoot, VerifyError,
-	MAX_SPECULATIVE_MESSAGE_LEN,
+	MessagesRequest, MessagesResponse, MmrFrontier, Register, StreamId, StreamProof, StreamsRoot,
+	VerifyError, MAX_SPECULATIVE_MESSAGE_LEN,
 };
 use parking_lot::Mutex;
 use sc_network::{IfDisconnected, NetworkRequest, PeerId, ProtocolName};
