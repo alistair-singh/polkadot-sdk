@@ -211,7 +211,8 @@ fn records(rounds: Rounds) -> impl Stream<Item = Option<Vec<u8>>> + Unpin {
 			}
 			log::info!(
 				target: LOG_TARGET,
-				"Found {} nodes of {para_id:?} on the relay chain DHT",
+				"Found {} nodes of {para_id:?} on the relay chain DHT; its record has {} addresses",
+				answers.len(),
 				record.addresses.len(),
 			);
 			let value = record.encode();
