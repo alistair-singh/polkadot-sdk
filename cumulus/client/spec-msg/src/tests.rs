@@ -575,6 +575,76 @@ fn a_lying_peer_is_skipped_for_an_honest_one() {
 	assert_eq!(run_fetch(&ArchiveTransport(vec![]), &req, None), Err(RequestError::NoPeers));
 }
 
+/// [`ArchiveTransport`] with an unreachable first peer, recording what `fetch` reports.
+struct Reporting {
+	unreachable: PeerId,
+	inner: ArchiveTransport,
+	reports: parking_lot::Mutex<Vec<(ParaId, PeerId, crate::Outcome)>>,
+}
+
+#[async_trait::async_trait]
+impl Transport for Reporting {
+	fn peers(&self, source: ParaId) -> Vec<PeerId> {
+		std::iter::once(self.unreachable).chain(self.inner.peers(source)).collect()
+	}
+
+	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
+		if peer == self.unreachable {
+			return Err("unreachable".into());
+		}
+		self.inner.request(peer, request).await
+	}
+
+	fn report(&self, source: ParaId, peer: PeerId, outcome: crate::Outcome) {
+		self.reports.lock().push((source, peer, outcome));
+	}
+}
+
+#[test]
+fn each_peer_tried_is_reported_but_a_refusal_is_not() {
+	use crate::Outcome::{Bad, Failed, Served};
+	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
+	let mut model = Model::default();
+	let a = channel(2000);
+	let root = import(&mut archive, &mut model, 1, vec![(a, payloads(1, 3))]);
+	let archive = Arc::new(archive);
+	let (liar, honest) =
+		((PeerId::random(), TestPeer { archive: archive.clone(), tamper: true }), honest(&archive));
+	let (liar_id, honest_id) = (liar.0, honest.0);
+	let transport = Reporting {
+		unreachable: PeerId::random(),
+		inner: ArchiveTransport(vec![liar, honest]),
+		reports: Default::default(),
+	};
+
+	assert!(run_fetch_with(&transport, &messages(a, 0, root, u32::MAX), None).is_ok());
+	let source = ParaId::from(1000);
+	assert_eq!(
+		*transport.reports.lock(),
+		vec![
+			(source, transport.unreachable, Failed),
+			(source, liar_id, Bad),
+			(source, honest_id, Served)
+		]
+	);
+
+	// A root nobody holds: every peer that answers refuses, and only the failure is reported.
+	transport.reports.lock().clear();
+	let mut elsewhere = TestArchive::open(Arc::new(MemoryStore::default()));
+	let other_root = import(&mut elsewhere, &mut Model::default(), 1, vec![(a, payloads(9, 1))]);
+	let unknown = messages(a, 0, other_root, u32::MAX);
+	assert!(run_fetch_with(&transport, &unknown, None).is_err());
+	assert_eq!(*transport.reports.lock(), vec![(source, transport.unreachable, Failed)]);
+}
+
+fn run_fetch_with(
+	transport: &impl Transport,
+	req: &MessagesRequest,
+	stored: Option<&MmrFrontier>,
+) -> Result<MessagesResponse, RequestError> {
+	futures::executor::block_on(fetch(transport, 1000.into(), req, stored))
+}
+
 #[test]
 fn typed_refusals_reach_the_caller() {
 	let mut archive = TestArchive::open(Arc::new(MemoryStore::default()));
