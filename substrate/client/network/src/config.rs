@@ -846,11 +846,15 @@ pub(crate) struct ClientKademliaRequest {
 impl ClientKademlia {
 	/// Open an instance on the DHT of the chain with `genesis_hash` and `fork_id`.
 	///
+	/// Unless `allow_private_ip`, the instance drops the non-global IP addresses remote peers
+	/// report.
+	///
 	/// `None` if the network has stopped, or already runs an instance on that DHT.
 	pub async fn open(
 		&self,
 		genesis_hash: &[u8],
 		fork_id: Option<&str>,
+		allow_private_ip: bool,
 	) -> Option<Litep2pKademliaHandle> {
 		use litep2p::protocol::libp2p::kademlia::{ConfigBuilder, KademliaMode};
 
@@ -860,10 +864,24 @@ impl ClientKademlia {
 				fork_id,
 			)])
 			.with_mode(KademliaMode::Client)
+			.with_remote_address_mode(Self::remote_address_mode(allow_private_ip))
 			.build();
 		let (reply, handle_rx) = futures::channel::oneshot::channel();
 		self.tx.unbounded_send(ClientKademliaRequest { config, handle, reply }).ok()?;
 		handle_rx.await.ok()
+	}
+
+	/// Which addresses an instance accepts from remote peers.
+	fn remote_address_mode(
+		allow_private_ip: bool,
+	) -> litep2p::protocol::libp2p::kademlia::RemoteAddressMode {
+		use litep2p::protocol::libp2p::kademlia::RemoteAddressMode;
+
+		if allow_private_ip {
+			RemoteAddressMode::All
+		} else {
+			RemoteAddressMode::GlobalOnly
+		}
 	}
 }
 
@@ -1090,6 +1108,14 @@ mod tests {
 		let kp1 = NodeKeyConfig::Ed25519(Secret::Input(sk.clone())).into_keypair().unwrap();
 		let kp2 = NodeKeyConfig::Ed25519(Secret::Input(sk)).into_keypair().unwrap();
 		assert!(secret_bytes(kp1) == secret_bytes(kp2));
+	}
+
+	#[test]
+	fn client_kademlia_uses_global_only_unless_private_ips_are_allowed() {
+		use litep2p::protocol::libp2p::kademlia::RemoteAddressMode;
+
+		assert_eq!(ClientKademlia::remote_address_mode(false), RemoteAddressMode::GlobalOnly);
+		assert_eq!(ClientKademlia::remote_address_mode(true), RemoteAddressMode::All);
 	}
 
 	#[test]

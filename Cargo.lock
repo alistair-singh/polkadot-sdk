@@ -18001,6 +18001,7 @@ dependencies = [
  "jam-std-common",
  "jam-types",
  "jsonrpsee 0.24.11",
+ "litep2p 0.17.0",
  "log",
  "nix 0.29.0",
  "pallet-bootnodes",
