@@ -37,7 +37,10 @@ pub use crate::{
 
 pub use litep2p::protocol::libp2p::{
 	bitswap::BitswapHandle as Litep2pBitswapHandle,
-	kademlia::{KademliaEvent as Litep2pKademliaEvent, KademliaHandle as Litep2pKademliaHandle},
+	kademlia::{
+		KademliaEvent as Litep2pKademliaEvent, KademliaHandle as Litep2pKademliaHandle,
+		QueryId as Litep2pKademliaQueryId,
+	},
 };
 pub use sc_network_types::{build_multiaddr, ed25519};
 use sc_network_types::{

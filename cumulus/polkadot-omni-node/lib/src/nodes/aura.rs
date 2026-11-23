@@ -665,6 +665,7 @@ where
 
 		let database_path = config.database.path().map(|p| p.to_path_buf());
 
+		let local_network = network.clone();
 		let _rpc_handlers = sc_service::spawn_tasks(sc_service::SpawnTasksParams {
 			network,
 			client: client.clone(),
@@ -734,6 +735,7 @@ where
 				let jam = Arc::new(jam);
 				spawn_essential.spawn_essential("jam-rpc-worker", Some("jam"), Box::pin(worker));
 
+				let discovery_queries = jam::bootnodes::discovery_queries();
 				for other_para in
 					jam::bootnodes::paras_to_follow(&jam_params.bootnodes_from, para_id.into())
 				{
@@ -746,6 +748,8 @@ where
 							other_para,
 							allow_private_ip,
 							client_kademlia.clone(),
+							local_network.clone(),
+							discovery_queries.clone(),
 						)),
 					);
 				}
