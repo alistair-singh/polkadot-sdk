@@ -1621,4 +1621,4 @@ zeroize = { opt-level = 3 }
 
 [patch.crates-io]
 # Runtime Kademlia registration, until it is released.
-litep2p = { git = "https://github.com/alistair-singh/litep2p", rev = "edcd0cd51a48c25433c4678cd63a146114d56a0f" }
+litep2p = { git = "https://github.com/alistair-singh/litep2p", rev = "c847f92fed6a9aaf9a0a1b1fbd997f05ea95e0b9" }
