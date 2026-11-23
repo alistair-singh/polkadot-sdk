@@ -4,9 +4,9 @@
 //! Speculative messaging end to end: two penpal chains open a channel and deliver an XCM with no
 //! HRMP channel between them.
 //!
-//! Each chain both sends and receives: the sender reads the receiver's `Ack` register, so each
-//! collator names the other as its static `--spec-msg-peer`. Zombienet derives a node's key from
-//! its name, so both peer ids are known before spawn.
+//! Each chain both sends and receives: the sender reads the receiver's `Ack` register. No node is
+//! told any peer: each follows the paras its runtime's channels name, finds their nodes on the
+//! relay chain DHT (RFC-0008) and joins each para's own DHT as a client.
 //!
 //! The delivery test logs one checkpoint per protocol step, each read from chain state: the
 //! sender's committed root, the relay's provides window, the receiver's consumption record, and
@@ -103,10 +103,7 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 			connect(RECEIVER_RPC_PORT).await?,
 		)
 	} else {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Ordinary,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
@@ -557,10 +554,7 @@ async fn spec_msg_delivers_across_collator_restarts() -> Result<(), anyhow::Erro
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Restarts,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::Restarts)?)
 		.await?;
 		let source = network.get_node(SENDER_COLLATOR)?;
 		let destination = network.get_node(RECEIVER_COLLATOR)?;
@@ -1191,9 +1185,13 @@ enum Join {
 	Warp,
 }
 
-/// A late sender-chain node that prunes state, and alone serves the receiver, opens the channel:
-/// the receiver consumes the `Hello` the sender sent before the node joined, then an XCM. The node
-/// major-syncs and archives each block's sends while its import notification pins the state.
+/// A late sender-chain node that prunes state joins before the channel opens: the receiver
+/// consumes the `Hello` the sender sent before the node joined, then an XCM. The node major-syncs
+/// and archives each block's sends while its import notification pins the state.
+///
+/// With static peers the late node alone served the receiver. With discovery the receiver finds
+/// the sender collator too, so this shows the late node seeds and backfills its archive, not that
+/// the receiver fetched only from it.
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_msg_late_full_sync_node_serves_history() -> Result<(), anyhow::Error> {
 	late_node_serves_history(Join::Full).await
@@ -1210,10 +1208,7 @@ async fn late_node_serves_history(join: Join) -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let mut network = initialize_network(build_network_config(
-		(LATE_NODE, LATE_P2P_PORT),
-		NetworkMode::Ordinary,
-	)?)
+	let mut network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 	.await?;
 	// Both late-node tests bind the same ports: free them before the next one starts.
 	let result = late_node_steps(&mut network, join).await;
@@ -1236,7 +1231,7 @@ async fn late_node_steps(
 	})
 	.await?;
 
-	// The receiver accepts and the sender sends `Hello`, which nothing serves the receiver yet.
+	// The receiver accepts and the sender sends `Hello`, before the late node exists.
 	submit_open(&sender, &receiver, SENDER, RECEIVER).await?;
 	wait_for("the sender to send `Hello`", || async {
 		let (_, out_channels) = channel_states(&sender, &receiver).await?;
@@ -1254,9 +1249,6 @@ async fn late_node_steps(
 		("-lsync=info,spec-msg=debug").into(),
 		("--enable-spec-msg").into(),
 		("--state-pruning", LATE_PRUNING.to_string().as_str()).into(),
-		("--spec-msg-peer", peer_arg(SENDER, SENDER_COLLATOR, SENDER_P2P_PORT)?.as_str()).into(),
-		("--spec-msg-peer", peer_arg(RECEIVER, RECEIVER_COLLATOR, RECEIVER_P2P_PORT)?.as_str())
-			.into(),
 		("--relay-chain-rpc-urls", "{{ZOMBIE:alice:ws_uri}}").into(),
 	];
 	if join == Join::Warp {
@@ -1271,7 +1263,7 @@ async fn late_node_steps(
 	network.add_collator(LATE_NODE, options, SENDER).await?;
 
 	wait_opened(&sender, &receiver, RECEIVER).await?;
-	log::info!("{LATE_NODE} served the `Hello` from #{hello}: the channel is open");
+	log::info!("The `Hello` from #{hello} was consumed: the channel is open");
 	send_and_follow(&relay, &sender, &receiver).await?;
 
 	// How the late node got the history: seeded and backfilled after a warp sync, else not.
@@ -1292,10 +1284,7 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Ordinary,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
@@ -1374,10 +1363,7 @@ async fn spec_msg_routes_across_three_parachains() -> Result<(), anyhow::Error> 
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::ThreeParachains,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::ThreeParachains)?)
 		.await?;
 		let a: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1459,10 +1445,7 @@ async fn spec_msg_drains_channels_closed_by_either_peer() -> Result<(), anyhow::
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Ordinary,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 		.await?;
 		let a: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1572,10 +1555,7 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Ordinary,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
@@ -1647,10 +1627,7 @@ async fn spec_msg_closed_channel_during_hrmp_cutover() -> Result<(), anyhow::Err
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(
-			(SENDER_COLLATOR, SENDER_P2P_PORT),
-			NetworkMode::Restarts,
-		)?)
+		let network = initialize_network(build_network_config(NetworkMode::Restarts)?)
 		.await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let source = network.get_node(SENDER_COLLATOR)?;
@@ -1827,10 +1804,7 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 	);
 	let control = tempfile::tempdir()?;
 	let gate = control.path().join("withhold");
-	let network = initialize_network(build_network_config(
-		(SENDER_COLLATOR, SENDER_P2P_PORT),
-		NetworkMode::Withhold(gate.clone()),
-	)?)
+	let network = initialize_network(build_network_config(NetworkMode::Withhold(gate.clone()))?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
@@ -2198,10 +2172,7 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 
-	let network = initialize_network(build_network_config(
-		(SENDER_COLLATOR, SENDER_P2P_PORT),
-		NetworkMode::Ordinary,
-	)?)
+	let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
@@ -2359,10 +2330,7 @@ async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let network = initialize_network(build_network_config(
-		(SENDER_COLLATOR, SENDER_P2P_PORT),
-		NetworkMode::RelayForks,
-	)?)
+	let network = initialize_network(build_network_config(NetworkMode::RelayForks)?)
 	.await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
@@ -2594,10 +2562,7 @@ async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> 
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let network = initialize_network(build_network_config(
-		(SENDER_COLLATOR, SENDER_P2P_PORT),
-		NetworkMode::Ordinary,
-	)?)
+	let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
 	.await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -3333,13 +3298,6 @@ async fn follow_delivery(
 		.map_err(|_| anyhow!("XCM not executed within 5 minutes"))?
 }
 
-/// `--spec-msg-peer` for the collator `name` of `para`, listening on `port`.
-fn peer_arg(para: u32, name: &str, port: u16) -> Result<String, anyhow::Error> {
-	let (_, peer_id) = zombienet_orchestrator::generators::generate_node_identity(name)
-		.map_err(|e| anyhow!("peer id of {name}: {e}"))?;
-	Ok(format!("{para}=/ip4/127.0.0.1/tcp/{port}/ws/p2p/{peer_id}"))
-}
-
 #[derive(PartialEq, Eq)]
 enum NetworkMode {
 	Ordinary,
@@ -3350,9 +3308,8 @@ enum NetworkMode {
 	Withhold(std::path::PathBuf),
 }
 
-/// Peers fetch the sender's streams from `sender_node`, which can be a late full node.
+/// No node is told any peer: each finds the other chains' nodes through the relay chain DHT.
 fn build_network_config(
-	sender_node: (&str, u16),
 	mode: NetworkMode,
 ) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
@@ -3426,14 +3383,6 @@ fn build_network_config(
 			("--authoring", "slot-based").into(),
 			("--enable-spec-msg").into(),
 		];
-		for &(peer_id, peer_name, peer_port, _) in &nodes {
-			if peer_id != id {
-				let (name, port) =
-					if peer_id == SENDER { sender_node } else { (peer_name, peer_port) };
-				let peer = peer_arg(peer_id, name, port)?;
-				args.push(("--spec-msg-peer", peer.as_str()).into());
-			}
-		}
 		network = network.with_parachain(|p| {
 			p.with_id(id)
 				.with_default_command("polkadot-parachain")
