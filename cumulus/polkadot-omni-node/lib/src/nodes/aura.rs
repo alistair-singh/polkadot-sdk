@@ -734,7 +734,9 @@ where
 				let jam = Arc::new(jam);
 				spawn_essential.spawn_essential("jam-rpc-worker", Some("jam"), Box::pin(worker));
 
-				for &other_para in &jam_params.bootnodes_from {
+				for other_para in
+					jam::bootnodes::paras_to_follow(&jam_params.bootnodes_from, para_id.into())
+				{
 					spawn.spawn(
 						"jam-bootnodes",
 						Some("jam"),

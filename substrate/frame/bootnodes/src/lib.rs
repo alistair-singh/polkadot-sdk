@@ -87,6 +87,11 @@ pub type TextMultiAddr = BoundedVec<u8, ConstU32<MAX_ADDRESS_LEN>>;
 /// The fork id of a chain. Empty for a chain without one.
 pub type ForkId = BoundedVec<u8, ConstU32<MAX_FORK_ID_LEN>>;
 
+/// Whether `fork_id` holds only letters, digits, `-` and `_`, as a [`ForkId`] must.
+pub fn is_valid_fork_id(fork_id: &[u8]) -> bool {
+	fork_id.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+}
+
 /// Publishes the record, e.g. to the para's key-value store on JAM.
 pub trait PublishBootnodes {
 	/// Publish `record`, a SCALE-encoded [`BootnodeRecord`], or withdraw it with `None`. An error
@@ -160,10 +165,7 @@ pub mod pallet {
 		) -> DispatchResult {
 			T::BootnodesOrigin::ensure_origin(origin)?;
 			let fork_id = fork_id.unwrap_or_default();
-			ensure!(
-				fork_id.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_'),
-				Error::<T>::InvalidForkId
-			);
+			ensure!(is_valid_fork_id(&fork_id), Error::<T>::InvalidForkId);
 			ensure!(!addresses.is_empty(), Error::<T>::NoAddresses);
 
 			let mut binary = BoundedVec::new();

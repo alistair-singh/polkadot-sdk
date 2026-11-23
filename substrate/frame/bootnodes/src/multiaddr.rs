@@ -259,6 +259,16 @@ enum Expect {
 
 /// Check that the binary address `addr` has the form this module describes.
 pub fn validate(addr: &[u8]) -> Result<(), Error> {
+	walk(addr, true)
+}
+
+/// Like [`validate`], but the `/p2p/<peer id>` at the end may be left out, as in the addresses
+/// a DHT reports for a peer.
+pub fn validate_without_peer_id(addr: &[u8]) -> Result<(), Error> {
+	walk(addr, false)
+}
+
+fn walk(addr: &[u8], peer_id_required: bool) -> Result<(), Error> {
 	if addr.is_empty() {
 		return Err(Error::Empty);
 	}
@@ -275,7 +285,12 @@ pub fn validate(addr: &[u8]) -> Result<(), Error> {
 		};
 		rest = after;
 	}
-	if expect == Expect::End {
+	let complete = match expect {
+		Expect::End => true,
+		Expect::WebSocketOrPeerId | Expect::PeerId => !peer_id_required,
+		Expect::Host | Expect::Tcp => false,
+	};
+	if complete {
 		Ok(())
 	} else {
 		Err(Error::InvalidLayout)
@@ -335,6 +350,19 @@ mod tests {
 			parse(&format!("{}/ws", with_peer("/ip4/1.2.3.4/tcp/1"))),
 			Err(Error::InvalidLayout)
 		);
+	}
+
+	#[test]
+	fn without_a_peer_id_the_same_shapes_are_accepted() {
+		for addr in ACCEPTED {
+			assert_eq!(validate_without_peer_id(&bytes(addr)), Ok(()), "{addr}");
+			assert_eq!(validate_without_peer_id(&bytes(&with_peer(addr))), Ok(()), "{addr}");
+		}
+		for addr in ["/ip4/1.2.3.4", "/ip4/1.2.3.4/udp/1/quic-v1", "/tcp/1", "/ip4/1.2.3.4/tcp/0"] {
+			assert!(validate_without_peer_id(&bytes(addr)).is_err(), "{addr}");
+		}
+		let rsa = bytes(&format!("/ip4/1.2.3.4/tcp/30333/p2p/{RSA_PEER}"));
+		assert_eq!(validate_without_peer_id(&rsa), Err(Error::InvalidPeerId));
 	}
 
 	#[test]

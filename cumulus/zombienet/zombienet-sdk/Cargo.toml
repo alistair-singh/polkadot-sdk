@@ -61,8 +61,7 @@ cumulus-jam-zombienet-tests = { path = "../jam-tests", optional = true }
 pallet-jam-kv = { workspace = true, default-features = true, optional = true }
 # The bootnode record and key the bootnodes test publishes and reads back.
 pallet-bootnodes = { workspace = true, default-features = true, optional = true }
-multiaddr = { workspace = true, optional = true }
-# The peer ids the bootnodes test lists and looks for.
+# The peer ids and addresses the bootnodes test lists and looks for.
 sc-network-types = { workspace = true, default-features = true, optional = true }
 # The Parachain Service's own state-key derivation and proof verification.
 parachain-service-core = { path = "../../../../parachain-service/core", features = ["std"], optional = true }
@@ -75,7 +74,6 @@ generate-snapshots = []
 jam = [
 	"cumulus-zombienet-sdk-helpers/jam",
 	"dep:cumulus-jam-zombienet-tests",
-	"dep:multiaddr",
 	"dep:pallet-bootnodes",
 	"dep:pallet-jam-kv",
 	"dep:parachain-service-core",

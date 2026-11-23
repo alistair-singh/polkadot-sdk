@@ -216,7 +216,7 @@ pub struct Cli<Config: CliConfig> {
 
 	/// EXPERIMENTAL (JAM): Join the DHT of another para through the bootnodes it publishes to JAM.
 	///
-	/// The para must have a record on JAM when this node starts. Repeat the flag for more paras.
+	/// Repeat the flag for more paras.
 	#[arg(long, value_name = "PARA_ID")]
 	pub jam_bootnodes_from: Vec<u32>,
 

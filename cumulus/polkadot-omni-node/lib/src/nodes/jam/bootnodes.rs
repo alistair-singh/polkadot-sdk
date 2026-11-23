@@ -22,7 +22,10 @@
 //!
 //! The reader follows JAM's finalized chain, so it never acts on a value that is later reverted.
 //! It opens the instance when a record first appears, and a new one when a record names another
-//! genesis hash or fork id.
+//! genesis hash or fork id. When the para clears its record, the reader closes the instance and
+//! forgets the para's peers, the ones it found included: a para that withdraws its bootnodes
+//! withdraws the way to reach it. Peers it banned stay banned. If the para publishes a record
+//! again, the reader opens a new instance and starts over.
 //!
 //! The peers it finds are kept in an [`AddressRecord`], for the messaging layer to dial through
 //! [`Peers`]: the record's bootnodes, and up to [`MAX_DISCOVERED_PEERS`] peers found on the DHT.
@@ -30,22 +33,24 @@
 //!
 //! `pallet-bootnodes` checks what it publishes, and the record's genesis hash can only be checked
 //! there. The reader still skips what it could not use, since the other para's runtime is not
-//! ours: an address [`pallet_bootnodes::multiaddr::validate`] rejects, and unless
-//! `--allow-private-ip` applies an address with a non-global IP.
+//! ours: a record whose fork id [`pallet_bootnodes::is_valid_fork_id`] rejects, an address
+//! [`pallet_bootnodes::multiaddr::validate`] rejects, and unless `--allow-private-ip` applies an
+//! address with a non-global IP. An address a DHT reports for a peer must have the same shape,
+//! the `/p2p/<peer id>` being optional but, if there, that peer's.
 
 use super::LOG_TARGET;
 use codec::DecodeAll;
 use futures::{Stream, StreamExt};
 use ip_network::IpNetwork;
 use jam_interface::{JamChainSource, JamStateSource, ServiceId};
-use pallet_bootnodes::{BootnodeRecord, BOOTNODES_KEY};
+use pallet_bootnodes::{BootnodeRecord, ForkId, BOOTNODES_KEY};
 use sc_network::{
 	config::{ClientKademlia, Litep2pKademliaEvent, Litep2pKademliaHandle},
 	multiaddr::Protocol,
 	Multiaddr, PeerId,
 };
 use std::{
-	collections::HashSet,
+	collections::{HashSet, VecDeque},
 	future::Future,
 	sync::{Arc, Mutex, MutexGuard, PoisonError},
 	time::Duration,
@@ -60,9 +65,26 @@ const MAX_DISCOVERED_PEERS: usize = 20;
 /// The most addresses kept for a peer: as many as a record may list.
 const MAX_ADDRESSES_PER_PEER: usize = pallet_bootnodes::MAX_BOOTNODES as usize;
 
+/// The most banned peers of a para remembered; the earliest banned is forgotten first.
+const MAX_BANNED: usize = 1024;
+
 /// Failures in a row after which a discovered peer is removed.
 // TODO: open question; one failure may be too few.
 const FAILURES_TO_REMOVE: u32 = 1;
+
+/// The paras of `from` to follow, each once and without `own`, ours.
+pub(crate) fn paras_to_follow(from: &[u32], own: u32) -> Vec<u32> {
+	let mut paras = from.to_vec();
+	paras.sort_unstable();
+	paras.dedup();
+	paras.retain(|&para_id| {
+		if para_id == own {
+			tracing::warn!(target: LOG_TARGET, para_id, "Not following the bootnodes of our own para.");
+		}
+		para_id != own
+	});
+	paras
+}
 
 /// How a request to one of a para's peers went, as the messaging layer reports it.
 // The messaging layer that reports these does not exist yet; only the tests do.
@@ -87,20 +109,48 @@ struct Discovered {
 	failures: u32,
 }
 
+/// Up to [`MAX_BANNED`] peers, forgetting the earliest banned first.
+#[derive(Default)]
+struct Banned {
+	order: VecDeque<PeerId>,
+	set: HashSet<PeerId>,
+}
+
+impl Banned {
+	fn insert(&mut self, peer_id: PeerId) {
+		if !self.set.insert(peer_id) {
+			return;
+		}
+		self.order.push_back(peer_id);
+		if self.order.len() > MAX_BANNED {
+			if let Some(earliest) = self.order.pop_front() {
+				self.set.remove(&earliest);
+			}
+		}
+	}
+
+	fn contains(&self, peer_id: &PeerId) -> bool {
+		self.set.contains(peer_id)
+	}
+}
+
 /// The peers of a para this node knows, each with its addresses: the bootnodes of the latest
 /// record, and up to [`MAX_DISCOVERED_PEERS`] peers found on the para's DHT.
 ///
 /// A peer found on the DHT only takes a free slot, and never pushes out another. It loses its slot
 /// once it fails [`FAILURES_TO_REMOVE`] times in a row, and may come back if found again. One
-/// that returns garbage is banned for the node's lifetime.
+/// that returns garbage is banned, unless the record lists it or listed it before the latest
+/// clear.
 struct AddressRecord {
 	para_id: u32,
 	allow_private_ip: bool,
 	/// The bootnodes of the latest record, apart from the discovered peers.
 	bootnodes: Vec<(PeerId, Vec<Multiaddr>)>,
+	/// The bootnodes the latest clear forgot.
+	cleared_bootnodes: HashSet<PeerId>,
 	/// In the order they were found.
 	discovered: Vec<Discovered>,
-	banned: HashSet<PeerId>,
+	banned: Banned,
 }
 
 impl AddressRecord {
@@ -109,8 +159,9 @@ impl AddressRecord {
 			para_id,
 			allow_private_ip,
 			bootnodes: Vec::new(),
+			cleared_bootnodes: HashSet::new(),
 			discovered: Vec::new(),
-			banned: HashSet::new(),
+			banned: Banned::default(),
 		}
 	}
 
@@ -129,9 +180,15 @@ impl AddressRecord {
 		self.bootnodes = bootnodes;
 	}
 
-	/// Note `peer_id` found on the DHT at `addresses`. Of those, only global ones are kept unless
-	/// private IPs are allowed. A known peer gets the new addresses; a new one with any is added if
-	/// a slot is free and it is not banned. Returns whether it was added.
+	/// Forget the bootnodes and the discovered peers. The banned peers stay banned.
+	fn clear(&mut self) {
+		self.cleared_bootnodes = self.bootnodes.drain(..).map(|(peer_id, _)| peer_id).collect();
+		self.discovered.clear();
+	}
+
+	/// Note `peer_id` found on the DHT at `addresses`. Of those, only the ones [`is_dialable`]
+	/// accepts are kept. A known peer gets the new addresses; a new one with any is added if a slot
+	/// is free and it is not banned. Returns whether it was added.
 	fn discovered(
 		&mut self,
 		peer_id: PeerId,
@@ -141,19 +198,26 @@ impl AddressRecord {
 			return false;
 		}
 		let allow_private_ip = self.allow_private_ip;
-		let usable = addresses.into_iter().filter(|addr| allow_private_ip || is_global(addr));
+		let usable = addresses
+			.into_iter()
+			.filter(|addr| is_dialable(addr, &peer_id, allow_private_ip));
 		if let Some(known) = self.discovered.iter_mut().find(|peer| peer.peer_id == peer_id) {
 			merge(&mut known.addresses, usable);
 			return false;
 		}
 		let mut addresses = Vec::new();
 		merge(&mut addresses, usable);
-		if addresses.is_empty() || self.discovered.len() >= MAX_DISCOVERED_PEERS {
+		if addresses.is_empty() || self.is_full() {
 			return false;
 		}
-		tracing::info!(target: LOG_TARGET, para_id = self.para_id, %peer_id, "Discovered a peer of para {}.", self.para_id);
+		tracing::debug!(target: LOG_TARGET, para_id = self.para_id, %peer_id, "Discovered a peer of the para.");
 		self.discovered.push(Discovered { peer_id, addresses, failures: 0 });
 		true
+	}
+
+	/// Whether every slot for a discovered peer is taken.
+	fn is_full(&self) -> bool {
+		self.discovered.len() >= MAX_DISCOVERED_PEERS
 	}
 
 	/// Act on how a request to `peer_id` went.
@@ -161,7 +225,7 @@ impl AddressRecord {
 		let para_id = self.para_id;
 		let Some(index) = self.discovered.iter().position(|peer| peer.peer_id == peer_id) else {
 			if outcome == Outcome::Garbage {
-				if self.is_bootnode(&peer_id) {
+				if self.is_bootnode(&peer_id) || self.cleared_bootnodes.contains(&peer_id) {
 					// TODO: open question; governance listed the bootnode, so it is not banned.
 					tracing::error!(target: LOG_TARGET, para_id, %peer_id, "A bootnode of the para returned data that fails the root check.");
 				} else {
@@ -170,7 +234,7 @@ impl AddressRecord {
 					self.banned.insert(peer_id);
 				}
 			}
-			// A bootnode stays until a record replaces it.
+			// A bootnode stays until a record replaces or clears it.
 			return;
 		};
 		match outcome {
@@ -202,15 +266,16 @@ impl AddressRecord {
 	}
 }
 
-/// Add each of `new` that `addresses` lacks, up to [`MAX_ADDRESSES_PER_PEER`].
+/// Add each of `new` to `addresses`, or move it to the end if `addresses` has it. Beyond
+/// [`MAX_ADDRESSES_PER_PEER`], the address that has gone longest without being added again is
+/// dropped.
 fn merge(addresses: &mut Vec<Multiaddr>, new: impl IntoIterator<Item = Multiaddr>) {
 	for addr in new {
+		addresses.retain(|known| *known != addr);
 		if addresses.len() >= MAX_ADDRESSES_PER_PEER {
-			return;
+			addresses.remove(0);
 		}
-		if !addresses.contains(&addr) {
-			addresses.push(addr);
-		}
+		addresses.push(addr);
 	}
 }
 
@@ -270,14 +335,15 @@ impl Join for ClientKademlia {
 /// A client-mode Kademlia instance on a para's DHT.
 struct Dht {
 	handle: Litep2pKademliaHandle,
-	/// The record the instance was opened for.
-	record: BootnodeRecord,
+	/// The genesis hash and fork id of the record the instance was opened for.
+	genesis: [u8; 32],
+	fork_id: ForkId,
 }
 
 impl Dht {
 	/// Whether `record` names the DHT this instance is on.
 	fn serves(&self, record: &BootnodeRecord) -> bool {
-		self.record.genesis == record.genesis && self.record.fork_id == record.fork_id
+		self.genesis == record.genesis && self.fork_id == record.fork_id
 	}
 
 	/// Add `seeds` to the routing table.
@@ -326,13 +392,23 @@ fn known_bootnode(address: &[u8], allow_private_ip: bool) -> Option<(PeerId, Mul
 	Some((peer_id, addr))
 }
 
-/// Whether `addr` has no non-global IP. A DNS host counts as global.
+/// Whether `addr`, reported for `peer_id`, has the shape of a bootnode's address with the
+/// `/p2p/<peer id>` optional, names no other peer, and unless `allow_private_ip` is global.
+fn is_dialable(addr: &Multiaddr, peer_id: &PeerId, allow_private_ip: bool) -> bool {
+	pallet_bootnodes::multiaddr::validate_without_peer_id(&addr.to_vec()).is_ok() &&
+		PeerId::try_from_multiaddr(addr).is_none_or(|named| named == *peer_id) &&
+		(allow_private_ip || is_global(addr))
+}
+
+/// Whether the host `addr` starts with is a global IP or a DNS name. An address that starts with
+/// no host is not global.
 fn is_global(addr: &Multiaddr) -> bool {
-	addr.iter().all(|protocol| match protocol {
-		Protocol::Ip4(ip) => IpNetwork::from(ip).is_global(),
-		Protocol::Ip6(ip) => IpNetwork::from(ip).is_global(),
-		_ => true,
-	})
+	match addr.iter().next() {
+		Some(Protocol::Ip4(ip)) => IpNetwork::from(ip).is_global(),
+		Some(Protocol::Ip6(ip)) => IpNetwork::from(ip).is_global(),
+		Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) => true,
+		_ => false,
+	}
 }
 
 /// The next event of `dht`, or never without one.
@@ -400,19 +476,26 @@ async fn discover(
 		tokio::select! {
 			value = values.next() => {
 				let Some(value) = value else { break };
-				on_value(&mut dht, &kademlia, &peers, para_id, allow_private_ip, value).await;
-			},
-			event = next_event(&mut dht) => {
-				let Some(Litep2pKademliaEvent::FindNodeSuccess { peers: found, .. }) = event else {
-					continue
-				};
-				let mut record = peers.lock();
-				for (peer, addresses) in found {
-					record.discovered(peer.into(), addresses.into_iter().map(Multiaddr::from));
+				if on_value(&mut dht, &kademlia, &peers, para_id, allow_private_ip, value).await {
+					discovery.reset_immediately();
 				}
 			},
+			event = next_event(&mut dht) => match event {
+				Some(Litep2pKademliaEvent::FindNodeSuccess { peers: found, .. }) => {
+					let mut record = peers.lock();
+					for (peer, addresses) in found {
+						record.discovered(peer.into(), addresses.into_iter().map(Multiaddr::from));
+					}
+				},
+				Some(_) => {},
+				None => {
+					tracing::warn!(target: LOG_TARGET, para_id, "The instance on the para's DHT ended; the next record joins it again.");
+					dht = None;
+				},
+			},
 			_ = discovery.tick(), if dht.is_some() => {
-				if let Some(dht) = &mut dht {
+				let full = peers.lock().is_full();
+				if let Some(dht) = dht.as_mut().filter(|_| !full) {
 					dht.handle.find_node(PeerId::random().into()).await;
 				}
 			},
@@ -421,8 +504,10 @@ async fn discover(
 }
 
 /// Seed `dht` with the record in `value`, opening an instance first if the record names a DHT
-/// `dht` is not on, and make the record's nodes the bootnodes in `peers`. A value that does not
-/// decode, a cleared record, or an instance that cannot be opened leaves both as they are.
+/// `dht` is not on, and make the record's nodes the bootnodes in `peers`. A cleared record closes
+/// the instance and forgets the para's peers, except the banned ones. A value that does not
+/// decode or has an invalid fork id, or an instance that cannot be opened, leaves both as they
+/// are. Returns whether an instance was opened.
 async fn on_value(
 	dht: &mut Option<Dht>,
 	kademlia: &impl Join,
@@ -430,32 +515,50 @@ async fn on_value(
 	para_id: u32,
 	allow_private_ip: bool,
 	value: Option<Vec<u8>>,
-) {
+) -> bool {
 	let record = match decode(value.as_deref()) {
 		Ok(Some(record)) => record,
-		Ok(None) => return,
+		Ok(None) => {
+			if let Some(previous) = dht.take() {
+				tracing::info!(target: LOG_TARGET, para_id, "The para cleared its bootnodes; left its DHT.");
+				// Waits until the instance has released its protocol names, so that a record
+				// published again can reopen the same DHT.
+				previous.handle.shutdown().await;
+			}
+			peers.lock().clear();
+			return false;
+		},
 		Err(error) => {
 			tracing::warn!(target: LOG_TARGET, para_id, ?error, "The para's bootnode record does not decode; keeping the DHT as it is.");
-			return;
+			return false;
 		},
 	};
+	if !pallet_bootnodes::is_valid_fork_id(&record.fork_id) {
+		tracing::warn!(target: LOG_TARGET, para_id, fork_id = ?record.fork_id, "The para's bootnode record has an invalid fork id; keeping the DHT as it is.");
+		return false;
+	}
+	let mut opened = false;
 	if !dht.as_ref().is_some_and(|dht| dht.serves(&record)) {
-		let fork_id = core::str::from_utf8(&record.fork_id).ok().filter(|id| !id.is_empty());
+		let fork_id = core::str::from_utf8(&record.fork_id).expect("a valid fork id is ASCII; qed");
+		let fork_id = Some(fork_id).filter(|id| !id.is_empty());
 		let Some(handle) = kademlia.join(&record.genesis, fork_id, allow_private_ip).await else {
 			tracing::warn!(target: LOG_TARGET, para_id, "Unable to join the para's DHT; keeping the DHT as it is.");
-			return;
+			return false;
 		};
 		tracing::info!(target: LOG_TARGET, para_id, "Joined the para's DHT.");
-		if let Some(previous) = dht.replace(Dht { handle, record: record.clone() }) {
+		let new = Dht { handle, genesis: record.genesis, fork_id: record.fork_id.clone() };
+		if let Some(previous) = dht.replace(new) {
 			// Waits until the instance has released its protocol names.
 			previous.handle.shutdown().await;
 		}
+		opened = true;
 	}
 	let seeds = seeds(&record, allow_private_ip);
 	if let Some(dht) = dht {
 		dht.seed(&seeds).await;
 	}
 	peers.lock().set_bootnodes(seeds);
+	opened
 }
 
 #[cfg(test)]
@@ -677,19 +780,101 @@ mod tests {
 		let mut record = AddressRecord::new(0, false);
 		assert!(!record.discovered(peer(10), [private.clone(), loopback.clone()]));
 		assert!(record.discovered(peer(11), [private.clone(), at(1), dns.clone(), at(1)]));
-		assert_eq!(record.peers(), vec![(peer(11), vec![at(1), dns.clone()])]);
+		assert_eq!(
+			record.peers(),
+			vec![(peer(11), vec![dns.clone(), at(1)])],
+			"a repeat moves last"
+		);
 
 		let mut record = AddressRecord::new(0, true);
 		assert!(record.discovered(peer(10), [private.clone(), loopback.clone(), private.clone()]));
-		assert_eq!(record.peers(), vec![(peer(10), vec![private, loopback])]);
+		assert_eq!(record.peers(), vec![(peer(10), vec![loopback, private])]);
 
 		// Addresses are bounded per peer, also across merges.
 		assert!(record.discovered(peer(11), (1..=6).map(at)));
 		assert!(!record.discovered(peer(11), (5..=12).map(at)));
-		assert_eq!(
-			record.peers()[1].1,
-			(1..=MAX_ADDRESSES_PER_PEER as u16).map(at).collect::<Vec<_>>()
-		);
+		assert_eq!(record.peers()[1].1, (5..=12).map(at).collect::<Vec<_>>());
+		assert_eq!(record.peers()[1].1.len(), MAX_ADDRESSES_PER_PEER);
+	}
+
+	fn parse(addr: &str) -> Multiaddr {
+		addr.parse().expect("the test's addresses parse; qed")
+	}
+
+	/// A DHT responder must not get this node to dial other transports, hosts or peers.
+	#[test]
+	fn a_discovered_address_needs_a_bootnodes_shape_and_no_other_peer_id() {
+		let own = address(10, "/ip4/8.8.8.8/tcp/2");
+		let wss = parse("/dns/b.example.org/tcp/1/wss");
+		let rejected = [
+			parse("/ip4/8.8.8.8/udp/1/quic-v1"),
+			parse("/ip4/8.8.8.8/tcp/1/p2p-circuit"),
+			parse("/memory/1"),
+			parse("/ip4/8.8.8.8/tcp/0"),
+			parse("/dns/localhost/tcp/1"),
+			address(11, "/ip4/8.8.8.8/tcp/3"),
+		];
+
+		let mut record = AddressRecord::new(0, true);
+		assert!(!record.discovered(peer(10), rejected.clone()));
+		let found = rejected.into_iter().chain([at(1), own.clone(), wss.clone()]);
+		assert!(record.discovered(peer(10), found));
+		assert_eq!(record.peers(), vec![(peer(10), vec![at(1), own, wss])]);
+	}
+
+	#[test]
+	fn an_address_without_a_host_is_not_global() {
+		assert!(!is_global(&parse("/memory/1")));
+		assert!(!is_global(&parse("/tcp/1")));
+		assert!(is_global(&at(1)));
+		assert!(is_global(&parse("/dns4/b.example.org/tcp/1")));
+	}
+
+	/// A responder that fills a peer's addresses with bogus ones is displaced by later reports.
+	#[test]
+	fn new_addresses_of_a_known_peer_push_out_its_oldest() {
+		let mut record = AddressRecord::new(0, false);
+		assert!(record.discovered(peer(10), (1..=MAX_ADDRESSES_PER_PEER as u16).map(at)));
+		// An address reported again counts as new.
+		assert!(!record.discovered(peer(10), [at(100), at(2)]));
+
+		let mut expected = (3..=MAX_ADDRESSES_PER_PEER as u16).map(at).collect::<Vec<_>>();
+		expected.extend([at(100), at(2)]);
+		assert_eq!(record.peers()[0].1, expected);
+	}
+
+	#[test]
+	fn the_banned_peers_are_bounded_and_the_earliest_is_forgotten_first() {
+		let mut banned = Banned::default();
+		let ids = (0..=MAX_BANNED).map(|_| PeerId::random()).collect::<Vec<_>>();
+		for id in &ids {
+			banned.insert(*id);
+		}
+		banned.insert(ids[1]);
+
+		assert!(!banned.contains(&ids[0]));
+		assert!(ids[1..].iter().all(|id| banned.contains(id)));
+		assert_eq!((banned.order.len(), banned.set.len()), (MAX_BANNED, MAX_BANNED));
+	}
+
+	#[test]
+	fn a_bootnode_forgotten_by_the_latest_clear_is_not_banned() {
+		let mut record = AddressRecord::new(0, false);
+		record.set_bootnodes(vec![(peer(1), address(1, "/ip4/8.8.8.8/tcp/1"))]);
+		record.clear();
+		record.report(peer(1), Outcome::Garbage);
+		assert!(record.discovered(peer(1), [at(1)]));
+
+		// Only until the next clear, which forgets no bootnode.
+		record.clear();
+		record.report(peer(1), Outcome::Garbage);
+		assert!(!record.discovered(peer(1), [at(1)]));
+	}
+
+	#[test]
+	fn the_paras_to_follow_are_deduplicated_without_our_own() {
+		assert_eq!(paras_to_follow(&[3, 1, 3, 2, 1], 2), vec![1, 3]);
+		assert_eq!(paras_to_follow(&[2, 2], 2), Vec::<u32>::new());
 	}
 
 	/// Joins every DHT at once, with a handle whose instance never runs.
@@ -715,6 +900,88 @@ mod tests {
 		}
 	}
 
+	impl Join for &Joined {
+		fn join(
+			&self,
+			genesis: &[u8],
+			fork_id: Option<&str>,
+			allow_private_ip: bool,
+		) -> impl Future<Output = Option<Litep2pKademliaHandle>> + Send {
+			(**self).join(genesis, fork_id, allow_private_ip)
+		}
+	}
+
+	fn joins(joined: &Joined) -> Vec<([u8; 32], Option<String>)> {
+		joined.0.lock().expect("no test panics while holding it; qed").clone()
+	}
+
+	/// The instances [`Joined`] opens end at once. The run drops each instead of polling it again,
+	/// and joins the DHT again for the next record, the same one.
+	#[tokio::test]
+	async fn an_instance_that_ended_is_dropped_and_the_next_record_joins_again() {
+		let joined = Joined::default();
+		let published = record(&[(1, "/ip4/8.8.8.8/tcp/1")]).encode();
+		let again = published.clone();
+		let values = Box::pin(futures::stream::once(async move {
+			tokio::time::sleep(Duration::from_millis(100)).await;
+			Some(again)
+		}));
+
+		let run = discover(Some(published), values, 0, false, &joined);
+		tokio::time::timeout(Duration::from_secs(5), run).await.expect("the run ends");
+		assert_eq!(joins(&joined), vec![([1; 32], None), ([1; 32], None)]);
+	}
+
+	#[tokio::test]
+	async fn a_record_with_an_invalid_fork_id_is_skipped() {
+		let joined = Joined::default();
+		let peers = Peers::new(0, false);
+		let mut dht = None;
+		let with_fork_id = |fork_id: &[u8]| {
+			let fork_id = fork_id.to_vec().try_into().expect("a short fork id; qed");
+			BootnodeRecord { fork_id, ..record(&[(1, "/ip4/8.8.8.8/tcp/1")]) }.encode()
+		};
+		for invalid in [&b"a/b"[..], &[0xff], b"a.b"] {
+			let value = Some(with_fork_id(invalid));
+			assert!(!on_value(&mut dht, &joined, &peers, 0, false, value).await);
+		}
+		assert!(dht.is_none());
+		assert_eq!(peers.peers(), vec![]);
+		assert_eq!(joins(&joined), vec![]);
+
+		let valid = Some(with_fork_id(b"fork-1_a"));
+		assert!(on_value(&mut dht, &joined, &peers, 0, false, valid).await);
+		// An invalid one later leaves the DHT as it is.
+		assert!(!on_value(&mut dht, &joined, &peers, 0, false, Some(with_fork_id(b"a/b"))).await);
+		assert_eq!(joins(&joined), vec![([1; 32], Some("fork-1_a".into()))]);
+		assert!(dht.is_some());
+	}
+
+	#[tokio::test]
+	async fn a_cleared_record_closes_the_dht_and_forgets_the_peers() {
+		let joined = Joined::default();
+		let peers = Peers::new(0, false);
+		let mut dht = None;
+		let published = record(&[(1, "/ip4/8.8.8.8/tcp/1")]);
+		on_value(&mut dht, &joined, &peers, 0, false, Some(published.encode())).await;
+		peers.lock().discovered(peer(10), [at(1)]);
+		peers.lock().discovered(peer(11), [at(2)]);
+		peers.report(peer(11), Outcome::Garbage);
+
+		on_value(&mut dht, &joined, &peers, 0, false, None).await;
+		assert!(dht.is_none());
+		assert_eq!(peers.peers(), vec![]);
+		// A banned peer stays banned.
+		assert!(!peers.lock().discovered(peer(11), [at(2)]));
+
+		// Published again on the same DHT, the record opens a new instance.
+		on_value(&mut dht, &joined, &peers, 0, false, Some(published.encode())).await;
+		let joined = joins(&joined);
+		assert_eq!(joined, vec![([1; 32], None), ([1; 32], None)]);
+		assert!(dht.is_some_and(|dht| dht.serves(&published)));
+		assert_eq!(peers.peers(), vec![(peer(1), vec![address(1, "/ip4/8.8.8.8/tcp/1")])]);
+	}
+
 	#[tokio::test]
 	async fn discovered_peers_survive_a_change_of_dht() {
 		let joined = Joined::default();
@@ -728,7 +995,7 @@ mod tests {
 		let second = BootnodeRecord { fork_id, ..record(&[(2, "/ip4/8.8.8.8/tcp/2")]) };
 		on_value(&mut dht, &joined, &peers, 0, false, Some(second.encode())).await;
 
-		let joined = joined.0.lock().expect("no test panics while holding it; qed").clone();
+		let joined = joins(&joined);
 		assert_eq!(joined, vec![([1; 32], None), ([1; 32], Some("fork".into()))]);
 		assert!(dht.is_some_and(|dht| dht.serves(&second)));
 		assert_eq!(
