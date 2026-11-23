@@ -718,18 +718,27 @@ async fn on_value(
 	if !dht.as_ref().is_some_and(|dht| dht.serves(&record)) {
 		let fork_id = core::str::from_utf8(&record.fork_id).expect("a valid fork id is ASCII; qed");
 		let fork_id = Some(fork_id).filter(|id| !id.is_empty());
-		let Some(handle) = kademlia.join(&record.genesis, fork_id, allow_private_ip).await else {
-			tracing::warn!(target: LOG_TARGET, para_id, "Unable to join the para's DHT; keeping the DHT as it is.");
-			return false;
-		};
-		tracing::info!(target: LOG_TARGET, para_id, "Joined the para's DHT.");
-		let new =
-			Dht { handle, genesis: record.genesis, fork_id: record.fork_id.clone(), query: None };
-		if let Some(previous) = dht.replace(new) {
-			// Waits until the instance has released its protocol names.
-			previous.handle.shutdown().await;
+		match kademlia.join(&record.genesis, fork_id, allow_private_ip).await {
+			Some(handle) => {
+				tracing::info!(target: LOG_TARGET, para_id, "Joined the para's DHT.");
+				let new = Dht {
+					handle,
+					genesis: record.genesis,
+					fork_id: record.fork_id.clone(),
+					query: None,
+				};
+				if let Some(previous) = dht.replace(new) {
+					// Waits until the instance has released its protocol names.
+					previous.handle.shutdown().await;
+				}
+				opened = true;
+			},
+			// The libp2p backend cannot open one. The record's bootnodes are still the para's
+			// peers: only the peers the para's DHT would add are missing.
+			None => {
+				tracing::error!(target: LOG_TARGET, para_id, "Unable to join the para's DHT; using only the bootnodes of its record.")
+			},
 		}
-		opened = true;
 	}
 	let local_peer_id = peers.lock().local_peer_id;
 	let seeds = seeds(&record, allow_private_ip, &local_peer_id);
@@ -899,17 +908,28 @@ mod tests {
 			.expect("no instance is opened");
 	}
 
-	/// A DHT that cannot be joined is logged and skipped, so this run reaches the end of the
+	/// A DHT that cannot be joined, as on the libp2p backend, is logged, and the record's
+	/// bootnodes are still the para's peers. With no instance this run reaches the end of the
 	/// stream.
 	#[tokio::test]
-	async fn a_record_whose_dht_cannot_be_joined_is_skipped() {
+	async fn a_record_whose_dht_cannot_be_joined_still_gives_its_bootnodes() {
 		let (config, kademlia) = kademlia();
 		drop(config);
-		let record = record(&[(1, "/ip4/8.8.8.8/tcp/1")]).encode();
+		let record = record(&[(1, "/ip4/8.8.8.8/tcp/1"), (2, "/ip4/8.8.4.4/tcp/2")]).encode();
 		let values = futures::stream::iter([Some(record.clone())]);
+		let peers = Peers::new(0, true, ours());
 
-		let run = discover(Some(record), values, 0, true, kademlia, Local, discovery_queries());
+		let run = super::discover(
+			peers.clone(),
+			Some(record),
+			values,
+			kademlia,
+			Local,
+			discovery_queries(),
+		);
 		tokio::time::timeout(Duration::from_secs(5), run).await.expect("the run ends");
+		let found: Vec<PeerId> = peers.peers().into_iter().map(|(peer_id, _)| peer_id).collect();
+		assert_eq!(found, vec![peer(1), peer(2)]);
 	}
 
 	/// A global address of a discovered peer; Kademlia reports addresses without the peer id.
