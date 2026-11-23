@@ -51,6 +51,28 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 
 const LOG_TARGET: &str = "bootnodes::source";
 
+/// The most providers one round asks over `/paranode`. Anyone can publish a provider record under
+/// a para's key, so a round asks a random sample of those found rather than all of them.
+pub const MAX_PROVIDERS_ASKED: usize = 16;
+
+/// The providers of `found` to ask next, in random order: those not yet `asked` and not
+/// `local`, while fewer than [`MAX_PROVIDERS_ASKED`] have been asked. Each is added to `asked`.
+fn to_ask(
+	found: impl IntoIterator<Item = PeerId>,
+	asked: &mut HashSet<PeerId>,
+	local: &PeerId,
+) -> Vec<PeerId> {
+	use rand::seq::SliceRandom;
+	let mut fresh: Vec<PeerId> =
+		found.into_iter().filter(|p| p != local && !asked.contains(p)).collect();
+	fresh.sort();
+	fresh.dedup();
+	fresh.shuffle(&mut rand::thread_rng());
+	fresh.truncate(MAX_PROVIDERS_ASKED.saturating_sub(asked.len()));
+	asked.extend(fresh.iter().copied());
+	fresh
+}
+
 /// A `/paranode` answer from a provider of another para. Nothing in it is checked but its shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParanodeAnswer {
@@ -205,11 +227,9 @@ impl SourceDiscovery {
 				},
 				event = events.select_next_some() => match event {
 					DhtEvent::ProvidersFound(found, providers) if found == key => {
-						for provider in providers {
-							if provider != local_relay_peer && asked.insert(provider) {
-								direct.insert(provider);
-								self.request(provider, &pending);
-							}
+						for provider in to_ask(providers, &mut asked, &local_relay_peer) {
+							direct.insert(provider);
+							self.request(provider, &pending);
 						}
 					},
 					DhtEvent::NoMoreProviders(found) | DhtEvent::ProvidersNotFound(found)
@@ -262,6 +282,26 @@ impl SourceDiscovery {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_round_asks_at_most_max_providers_never_twice_nor_itself() {
+		let local = PeerId::random();
+		let found: Vec<PeerId> = (0..40).map(|_| PeerId::random()).collect();
+		let mut asked = HashSet::new();
+
+		let first =
+			to_ask(found[..10].iter().copied().chain([local, found[0]]), &mut asked, &local);
+		assert_eq!(first.len(), 10);
+		assert!(!first.contains(&local));
+
+		// A later batch repeats some of the first: only new ones are asked, up to the cap.
+		let second = to_ask(found.iter().copied(), &mut asked, &local);
+		assert_eq!(second.len(), MAX_PROVIDERS_ASKED - 10);
+		assert!(second.iter().all(|p| !first.contains(p)));
+		assert_eq!(asked.len(), MAX_PROVIDERS_ASKED);
+
+		assert!(to_ask(found.iter().copied(), &mut asked, &local).is_empty());
+	}
 
 	fn response(peer_id: &PeerId, addrs: &[&str], genesis: u8, fork_id: Option<&str>) -> Vec<u8> {
 		Response {
