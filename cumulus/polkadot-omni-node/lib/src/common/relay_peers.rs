@@ -206,6 +206,15 @@ fn records(rounds: Rounds) -> impl Stream<Item = Option<Vec<u8>>> + Unpin {
 				log::debug!(target: LOG_TARGET, "No usable node of {para_id:?} on the relay chain DHT yet");
 				continue;
 			};
+			let chosen = Some((record.genesis, record.fork_id.clone()));
+			let dissenting = answers.iter().filter(|answer| dht_of(answer) != chosen).count();
+			if dissenting > 0 {
+				log::info!(
+					target: LOG_TARGET,
+					"{dissenting} of {} nodes of {para_id:?} name another DHT or none; left them out",
+					answers.len(),
+				);
+			}
 			if rounds.previous.as_ref() == Some(&record) {
 				continue;
 			}
