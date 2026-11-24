@@ -383,6 +383,62 @@ impl pallet_jam_kv::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type SelfParaId = SelfParaIdU32;
 	type MaxKeyLen = ConstU32<128>;
-	type MaxValueLen = ConstU32<4096>;
+	type MaxValueLen = ConstU32<JAM_KV_MAX_VALUE_LEN>;
 	type MaxBytesPerBlock = ConstU32<{ 16 * 1024 }>;
+	type ReservedKeys = JamKvReservedKeys;
+}
+
+/// `pallet-bootnodes` owns `bootnodes/v1`, and is the only check on what is published there.
+#[cfg(jam)]
+pub struct JamKvReservedKeys;
+
+#[cfg(jam)]
+impl frame_support::traits::Contains<frame_support::BoundedVec<u8, ConstU32<128>>>
+	for JamKvReservedKeys
+{
+	fn contains(key: &frame_support::BoundedVec<u8, ConstU32<128>>) -> bool {
+		key.as_slice() == pallet_bootnodes::BOOTNODES_KEY
+	}
+}
+
+/// The largest value the para writes to its key/value storage.
+#[cfg(jam)]
+const JAM_KV_MAX_VALUE_LEN: u32 = 4096;
+
+// The largest record fits one key/value entry.
+#[cfg(jam)]
+const _: () = assert!(pallet_bootnodes::MAX_RECORD_LEN <= JAM_KV_MAX_VALUE_LEN);
+
+/// Publishes the bootnode record to the para's key/value storage in the Parachain Service, under
+/// [`pallet_bootnodes::BOOTNODES_KEY`].
+#[cfg(jam)]
+pub struct BootnodesToJamKv;
+
+#[cfg(jam)]
+impl pallet_bootnodes::PublishBootnodes for BootnodesToJamKv {
+	fn publish(record: Option<&[u8]>) -> sp_runtime::DispatchResult {
+		use sp_runtime::DispatchError;
+		let key = pallet_bootnodes::BOOTNODES_KEY
+			.to_vec()
+			.try_into()
+			.map_err(|_| DispatchError::Other("the bootnodes key exceeds MaxKeyLen"))?;
+		match record {
+			Some(record) => {
+				let value = record
+					.to_vec()
+					.try_into()
+					.map_err(|_| DispatchError::Other("the bootnode record exceeds MaxValueLen"))?;
+				pallet_jam_kv::Pallet::<Runtime>::do_set_kv(key, value)
+			},
+			None => pallet_jam_kv::Pallet::<Runtime>::do_remove_kv(key),
+		}
+	}
+}
+
+/// Root sets the para's bootnodes, published to JAM through `JamKv`.
+#[cfg(jam)]
+impl pallet_bootnodes::Config for Runtime {
+	type BootnodesOrigin = EnsureRoot<AccountId>;
+	type Publisher = BootnodesToJamKv;
+	type WeightInfo = ();
 }

@@ -48,6 +48,7 @@
 
 pub(crate) mod authorizer;
 pub(crate) mod block_import;
+pub(crate) mod bootnodes;
 pub(crate) mod builder_task;
 pub(crate) mod collation_task;
 pub(crate) mod hash_ledger;
