@@ -1188,9 +1188,10 @@ enum Join {
 /// consumes the `Hello` the sender sent before the node joined, then an XCM. The node major-syncs
 /// and archives each block's sends while its import notification pins the state.
 ///
-/// With static peers the late node alone served the receiver. With discovery the receiver finds
-/// the sender collator too, so this shows the late node seeds and backfills its archive, not that
-/// the receiver fetched only from it.
+/// The receiver's collator is paused from the `Hello` until the late node is up, so the `Hello` is
+/// still unconsumed when it joins. With discovery the receiver also finds the sender collator, so
+/// this shows the late node archives (or seeds and backfills) the history, not that the receiver
+/// fetched only from it.
 #[tokio::test(flavor = "multi_thread")]
 async fn spec_msg_late_full_sync_node_serves_history() -> Result<(), anyhow::Error> {
 	late_node_serves_history(Join::Full).await
@@ -1237,6 +1238,10 @@ async fn late_node_steps(
 	})
 	.await?;
 	let hello = sender.blocks().at(best_hash(&sender).await?).await?.number();
+	// Discovery finds the sender collator, so the receiver would consume `Hello` before the late
+	// node exists, leaving it nothing to backfill. Hold the receiver until the late node is up.
+	let receiver_collator = network.get_node(RECEIVER_COLLATOR)?.clone();
+	receiver_collator.pause().await?;
 	wait_for("the sender to finalize past the late node's pruning window", || async {
 		Ok(finalized_number(&sender).await? > hello + LATE_PRUNING + 4)
 	})
@@ -1259,6 +1264,18 @@ async fn late_node_steps(
 		..Default::default()
 	};
 	network.add_collator(LATE_NODE, options, SENDER).await?;
+
+	// Up means seeded after a warp sync, or the `Hello` block archived after a full sync.
+	let up = match join {
+		Join::Warp => "seeded the archive".to_string(),
+		Join::Full => format!("Archived block #{hello} "),
+	};
+	let options = LogLineCountOptions::new(|n| n >= 1, Duration::from_secs(300), false);
+	let late = network.get_node(LATE_NODE)?;
+	if !late.wait_log_line_count_with_timeout(&up, false, options).await?.success() {
+		return Err(anyhow!("{LATE_NODE} never logged \"{up}\""));
+	}
+	receiver_collator.resume().await?;
 
 	wait_opened(&sender, &receiver, RECEIVER).await?;
 	log::info!("The `Hello` from #{hello} was consumed: the channel is open");
