@@ -103,8 +103,7 @@ async fn spec_msg_delivers_xcm_without_hrmp() -> Result<(), anyhow::Error> {
 			connect(RECEIVER_RPC_PORT).await?,
 		)
 	} else {
-		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-		.await?;
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -554,8 +553,7 @@ async fn spec_msg_delivers_across_collator_restarts() -> Result<(), anyhow::Erro
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(NetworkMode::Restarts)?)
-		.await?;
+		let network = initialize_network(build_network_config(NetworkMode::Restarts)?).await?;
 		let source = network.get_node(SENDER_COLLATOR)?;
 		let destination = network.get_node(RECEIVER_COLLATOR)?;
 		let sender: OnlineClient<PolkadotConfig> = source.wait_client().await?;
@@ -971,7 +969,8 @@ async fn close_at_full_window(
 		let drained = states.get(&in_channel()).is_some_and(|s| {
 			s.session == session &&
 				s.status == RegisterStatus::Closed { session } &&
-				!s.draining && s.open.is_none() &&
+				!s.draining &&
+				s.open.is_none() &&
 				s.frontier == end
 		}) && queued_at(receiver, block.hash()).await? == 0;
 		if drained {
@@ -1208,8 +1207,7 @@ async fn late_node_serves_history(join: Join) -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let mut network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-	.await?;
+	let mut network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 	// Both late-node tests bind the same ports: free them before the next one starts.
 	let result = late_node_steps(&mut network, join).await;
 	network.destroy().await?;
@@ -1284,8 +1282,7 @@ async fn spec_msg_prefers_hrmp_when_both_channels_are_open() -> Result<(), anyho
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-		.await?;
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1363,8 +1360,8 @@ async fn spec_msg_routes_across_three_parachains() -> Result<(), anyhow::Error> 
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(NetworkMode::ThreeParachains)?)
-		.await?;
+		let network =
+			initialize_network(build_network_config(NetworkMode::ThreeParachains)?).await?;
 		let a: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 		let b: OnlineClient<PolkadotConfig> =
@@ -1445,8 +1442,7 @@ async fn spec_msg_drains_channels_closed_by_either_peer() -> Result<(), anyhow::
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-		.await?;
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 		let a: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 		let b: OnlineClient<PolkadotConfig> =
@@ -1523,7 +1519,8 @@ async fn spec_msg_drains_channels_closed_by_either_peer() -> Result<(), anyhow::
 						.await?;
 				let Some(state) = states.get(&key) else { return Ok(false) };
 				if !matches!(state.status, RegisterStatus::Closed { session } if session == state.session) ||
-					state.draining || state.open.is_some()
+					state.draining ||
+					state.open.is_some()
 				{
 					return Ok(false);
 				}
@@ -1555,8 +1552,7 @@ async fn spec_msg_hrmp_cutover_and_rollback() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-		.await?;
+		let network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let sender: OnlineClient<PolkadotConfig> =
 			network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -1627,8 +1623,7 @@ async fn spec_msg_closed_channel_during_hrmp_cutover() -> Result<(), anyhow::Err
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 	let test = async {
-		let network = initialize_network(build_network_config(NetworkMode::Restarts)?)
-		.await?;
+		let network = initialize_network(build_network_config(NetworkMode::Restarts)?).await?;
 		let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 		let source = network.get_node(SENDER_COLLATOR)?;
 		let destination = network.get_node(RECEIVER_COLLATOR)?;
@@ -1804,8 +1799,8 @@ async fn spec_msg_waits_for_a_withheld_sender_candidate() -> Result<(), anyhow::
 	);
 	let control = tempfile::tempdir()?;
 	let gate = control.path().join("withhold");
-	let network = initialize_network(build_network_config(NetworkMode::Withhold(gate.clone()))?)
-	.await?;
+	let network =
+		initialize_network(build_network_config(NetworkMode::Withhold(gate.clone()))?).await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -2172,8 +2167,7 @@ async fn spec_msg_vs_hrmp_latency() -> Result<(), anyhow::Error> {
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
 
-	let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-	.await?;
+	let network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -2330,8 +2324,7 @@ async fn spec_msg_survives_relay_forks() -> Result<(), anyhow::Error> {
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let network = initialize_network(build_network_config(NetworkMode::RelayForks)?)
-	.await?;
+	let network = initialize_network(build_network_config(NetworkMode::RelayForks)?).await?;
 	let relay: OnlineClient<PolkadotConfig> = network.get_node("alice")?.wait_client().await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
@@ -2562,8 +2555,7 @@ async fn spec_msg_consumes_across_bundled_blocks() -> Result<(), anyhow::Error> 
 	let _ = env_logger::try_init_from_env(
 		env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
 	);
-	let network = initialize_network(build_network_config(NetworkMode::Ordinary)?)
-	.await?;
+	let network = initialize_network(build_network_config(NetworkMode::Ordinary)?).await?;
 	let sender: OnlineClient<PolkadotConfig> =
 		network.get_node(SENDER_COLLATOR)?.wait_client().await?;
 	let receiver: OnlineClient<PolkadotConfig> =
@@ -3306,12 +3298,19 @@ enum NetworkMode {
 	ThreeParachains,
 	/// Both validators run Malus `withhold-availability` for the sender, gated by this file.
 	Withhold(std::path::PathBuf),
+	/// The sender chain also has [`HIDDEN_NODE`], a full node that publishes no provider record on
+	/// the relay chain DHT (`--no-dht-bootnode`): only the sender's own DHT knows it.
+	HiddenSenderNode,
 }
 
+/// A full node of the sender chain the relay chain DHT does not name, in
+/// [`NetworkMode::HiddenSenderNode`].
+const HIDDEN_NODE: &str = "eve";
+const HIDDEN_P2P_PORT: u16 = 30_502;
+const HIDDEN_RPC_PORT: u16 = 30_513;
+
 /// No node is told any peer: each finds the other chains' nodes through the relay chain DHT.
-fn build_network_config(
-	mode: NetworkMode,
-) -> Result<NetworkConfig, anyhow::Error> {
+fn build_network_config(mode: NetworkMode) -> Result<NetworkConfig, anyhow::Error> {
 	let images = zombienet_sdk::environment::get_images_from_env();
 	let mut nodes = vec![
 		(SENDER, SENDER_COLLATOR, SENDER_P2P_PORT, SENDER_RPC_PORT),
@@ -3375,23 +3374,43 @@ fn build_network_config(
 		}
 	});
 	for &(id, name, p2p, rpc) in &nodes {
-		let mut args = vec![
+		let args: Vec<zombienet_sdk::Arg> = vec![
 			("-lparachain=debug,spec-msg=debug,xcm=info,cumulus-collator=debug,\
-			  runtime::spec-msg=debug,runtime::parachain-system=debug")
+			  runtime::spec-msg=debug,runtime::parachain-system=debug,\
+			  relay-peers=debug,para-peers=debug")
 				.into(),
 			("--force-authoring").into(),
 			("--authoring", "slot-based").into(),
 			("--enable-spec-msg").into(),
 		];
+		let hidden = (mode == NetworkMode::HiddenSenderNode && id == SENDER).then(|| {
+			let args: Vec<zombienet_sdk::Arg> = vec![
+				("-lspec-msg=debug,para-peers=debug").into(),
+				("--enable-spec-msg").into(),
+				("--no-dht-bootnode").into(),
+			];
+			args
+		});
 		network = network.with_parachain(|p| {
-			p.with_id(id)
+			let p = p
+				.with_id(id)
 				.with_default_command("polkadot-parachain")
 				.with_default_image(images.cumulus.as_str())
 				.with_chain(format!("penpal-rococo-{id}").as_str())
 				// Separate protocol IDs prevent cross-chain block announcements and genesis bans.
 				.with_raw_spec_override(serde_json::json!({ "protocolId": format!("penpal-{id}") }))
-				.with_default_args(args)
-				.with_collator(|n| n.with_name(name).with_p2p_port(p2p).with_rpc_port(rpc))
+				.with_default_args(args);
+			let p = p.with_collator(|n| n.with_name(name).with_p2p_port(p2p).with_rpc_port(rpc));
+			match hidden {
+				Some(args) => p.with_collator(|n| {
+					n.with_name(HIDDEN_NODE)
+						.validator(false)
+						.with_p2p_port(HIDDEN_P2P_PORT)
+						.with_rpc_port(HIDDEN_RPC_PORT)
+						.with_args(args)
+				}),
+				None => p,
+			}
 		});
 	}
 	network
@@ -3408,3 +3427,6 @@ fn build_network_config(
 			anyhow!("config errs: {errs}")
 		})
 }
+
+#[path = "spec_msg_discovery.rs"]
+mod discovery;
