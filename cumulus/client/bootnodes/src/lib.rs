@@ -22,11 +22,13 @@
 mod advertisement;
 mod config;
 mod discovery;
+mod source;
 mod task;
 
 mod schema {
 	include!(concat!(env!("OUT_DIR"), "/response.rs"));
 }
 
-pub use config::bootnode_request_response_config;
+pub use config::{bootnode_request_response_config, paranode_protocol_name};
+pub use source::{decode_answer, ParanodeAnswer, SourceDiscovery};
 pub use task::{start_bootnode_tasks, StartBootnodeTasksParams};

@@ -24,14 +24,19 @@ codec = { workspace = true, default-features = true }
 color-print = { workspace = true }
 docify = { workspace = true }
 futures = { workspace = true }
+ip_network = { workspace = true }
 log = { workspace = true, default-features = true }
 parking_lot = { workspace = true, default-features = true }
 serde = { features = ["derive"], workspace = true, default-features = true }
 serde_json = { workspace = true, default-features = true }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
+tracing = { workspace = true, default-features = true }
 
 # Local
 frame-metadata = { workspace = true, default-features = true }
 jsonrpsee = { features = ["server"], workspace = true }
+# The bootnode record a para's DHT is named by, and the checks on its addresses.
+pallet-bootnodes = { workspace = true, default-features = true }
 parachains-common-types = { workspace = true, default-features = true }
 scale-info = { workspace = true }
 subxt-metadata = { workspace = true, default-features = true }
@@ -124,8 +129,10 @@ sc-consensus-aura = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 cumulus-test-runtime = { workspace = true }
+# The para peers' tests build Kademlia handles whose instances never run.
+litep2p = { workspace = true }
 nix = { features = ["signal"], workspace = true }
-tokio = { workspace = true, features = ["macros", "parking_lot", "time"] }
+tokio = { workspace = true, features = ["macros", "parking_lot", "test-util", "time"] }
 wait-timeout = { workspace = true }
 
 [features]

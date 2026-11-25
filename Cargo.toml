@@ -354,6 +354,7 @@ members = [
 	"substrate/frame/beefy-mmr",
 	"substrate/frame/benchmarking",
 	"substrate/frame/benchmarking/pov",
+	"substrate/frame/bootnodes",
 	"substrate/frame/bounties",
 	"substrate/frame/broker",
 	"substrate/frame/child-bounties",
@@ -1001,6 +1002,7 @@ pallet-bags-list-remote-tests = { path = "substrate/frame/bags-list/remote-tests
 pallet-balances = { path = "substrate/frame/balances", default-features = false }
 pallet-beefy = { path = "substrate/frame/beefy", default-features = false }
 pallet-beefy-mmr = { path = "substrate/frame/beefy-mmr", default-features = false }
+pallet-bootnodes = { path = "substrate/frame/bootnodes", default-features = false }
 pallet-bounties = { path = "substrate/frame/bounties", default-features = false }
 pallet-bridge-grandpa = { path = "bridges/modules/grandpa", default-features = false }
 pallet-bridge-messages = { path = "bridges/modules/messages", default-features = false }
@@ -1593,3 +1595,7 @@ twox-hash = { opt-level = 3 }
 wasmi = { opt-level = 3 }
 x25519-dalek = { opt-level = 3 }
 zeroize = { opt-level = 3 }
+
+[patch.crates-io]
+# Runtime Kademlia registration and the open Kademlia fixes, until they are released.
+litep2p = { git = "https://github.com/alistair-singh/litep2p", rev = "d2b7840435c5b6f2be1d8418b934661b90286fe7" }

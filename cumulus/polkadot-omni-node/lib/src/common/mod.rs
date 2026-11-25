@@ -21,6 +21,8 @@
 pub(crate) mod aura;
 pub mod chain_spec;
 pub mod command;
+pub(crate) mod para_peers;
+pub(crate) mod relay_peers;
 pub mod rpc;
 pub mod runtime;
 pub mod spec;

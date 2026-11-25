@@ -16,8 +16,8 @@
 // along with Cumulus. If not, see <https://www.gnu.org/licenses/>.
 
 //! The requester side of `/spec-msg/fetch/1`: try the source's peers in turn and accept the
-//! first response that verifies under the named root. Some refusals are expected, so no peer is
-//! penalized.
+//! first response that verifies under the named root. Some refusals are expected, so a refusal is
+//! not reported; a response that does not verify is.
 
 use crate::{protocol::PROTOCOL_NAME, LOG_TARGET};
 use codec::{DecodeLimit, Encode, MaxEncodedLen};
@@ -34,6 +34,18 @@ use std::{collections::BTreeMap, sync::Arc};
 /// Decoding depth limit for responses. They hold flat vectors; this only blocks crafted nesting.
 const MAX_DECODE_DEPTH: u32 = 16;
 
+/// How a request to one of a source's peers went, for the [`Transport`] to act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+	/// The peer answered with a response that verified.
+	Served,
+	/// The request failed: the peer could not be reached, or did not answer in time.
+	Failed,
+	/// The peer answered with junk, or with a response that does not verify under the root the
+	/// request named.
+	Bad,
+}
+
 /// How a request reaches a source's collators.
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
@@ -42,6 +54,9 @@ pub trait Transport: Send + Sync {
 
 	/// Send one encoded request to `peer` and return the encoded response.
 	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String>;
+
+	/// Note how a request to `source`'s `peer` went. A refusal is not reported.
+	fn report(&self, _source: ParaId, _peer: PeerId, _outcome: Outcome) {}
 }
 
 /// Rotates the first peer asked each round so a peer whose verified replies lack the needed
@@ -75,6 +90,10 @@ impl<T: Transport + ?Sized> Transport for Rotating<T> {
 
 	async fn request(&self, peer: PeerId, request: Vec<u8>) -> Result<Vec<u8>, String> {
 		self.inner.request(peer, request).await
+	}
+
+	fn report(&self, source: ParaId, peer: PeerId, outcome: Outcome) {
+		self.inner.report(source, peer, outcome)
 	}
 }
 
@@ -153,6 +172,7 @@ pub async fn fetch<T: Transport + ?Sized>(
 			Ok(bytes) => bytes,
 			Err(e) => {
 				log::debug!(target: LOG_TARGET, "Peer {peer} of {source:?} did not serve: {e}");
+				transport.report(source, peer, Outcome::Failed);
 				continue;
 			},
 		};
@@ -161,6 +181,7 @@ pub async fn fetch<T: Transport + ?Sized>(
 			Ok(response) if input.is_empty() => response,
 			_ => {
 				log::debug!(target: LOG_TARGET, "Peer {peer} of {source:?} sent junk");
+				transport.report(source, peer, Outcome::Bad);
 				continue;
 			},
 		};
@@ -177,7 +198,10 @@ pub async fn fetch<T: Transport + ?Sized>(
 			None => verify_messages(request, &response),
 		};
 		match verified {
-			Ok(()) => return Ok(response),
+			Ok(()) => {
+				transport.report(source, peer, Outcome::Served);
+				return Ok(response);
+			},
 			Err(VerifyError::FrontierMismatch)
 				if stored.is_some_and(|stored| {
 					response.frontier.leaf_count() == stored.leaf_count()
@@ -190,6 +214,8 @@ pub async fn fetch<T: Transport + ?Sized>(
 					request.stream,
 					request.under,
 				);
+				// The response verifies on its own: the peer served the stream it was asked for.
+				transport.report(source, peer, Outcome::Served);
 				return Err(RequestError::Diverged);
 			},
 			Err(e) => {
@@ -197,6 +223,7 @@ pub async fn fetch<T: Transport + ?Sized>(
 					target: LOG_TARGET,
 					"Response of peer {peer} of {source:?} does not verify: {e:?}",
 				);
+				transport.report(source, peer, Outcome::Bad);
 			},
 		}
 	}

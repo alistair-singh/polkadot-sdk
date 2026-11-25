@@ -40,7 +40,7 @@ pub mod store;
 pub mod worker;
 
 pub use archive::{Archive, ArchiveError, Tip};
-pub use fetch::{fetch, NetworkTransport, RequestError, Transport};
+pub use fetch::{fetch, NetworkTransport, Outcome, RequestError, Transport};
 pub use protocol::{fetch_protocol_config, run_request_handler, PROTOCOL_NAME};
 pub use receiver::{Budget, ChainView, Receiver, SourceWants};
 pub use relay::{

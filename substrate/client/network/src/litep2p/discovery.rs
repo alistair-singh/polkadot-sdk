@@ -267,7 +267,7 @@ fn legacy_kademlia_protocol_name(id: &ProtocolId) -> ProtocolName {
 }
 
 /// Kademlia protocol name based on `genesis_hash` and `fork_id`.
-fn kademlia_protocol_name<Hash: AsRef<[u8]>>(
+pub(crate) fn kademlia_protocol_name<Hash: AsRef<[u8]>>(
 	genesis_hash: Hash,
 	fork_id: Option<&str>,
 ) -> ProtocolName {

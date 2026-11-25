@@ -444,10 +444,14 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 					(proto, config)
 				});
 
-			let spec_msg_requests = node_extra_args
-				.spec_msg
-				.as_ref()
-				.map(|_| spec_msg::register_protocol::<_, Net>(&mut net_config));
+			let spec_msg_requests = node_extra_args.spec_msg.as_ref().map(|_| {
+				let requests = spec_msg::register_protocol::<_, Net>(&mut net_config);
+				(requests, net_config.client_kademlia())
+			});
+			let allow_private_ip = matches!(
+				parachain_config.network.transport,
+				sc_network::config::TransportConfig::Normal { allow_private_ip: true, .. },
+			);
 
 			let (network, system_rpc_tx, tx_handler_controller, sync_service, bitswap_handle) =
 				build_network(BuildNetworkParams {
@@ -498,12 +502,19 @@ pub(crate) trait NodeSpec: BaseNodeSpec {
 
 			let spec_msg_receiver =
 				node_extra_args.spec_msg.as_ref().zip(spec_msg_requests).and_then(
-					|(config, requests)| {
+					|(config, (requests, kademlia))| {
 						spec_msg::start(
 							config,
 							client.clone(),
 							backend.clone(),
-							network.clone(),
+							spec_msg::SpecMsgNetwork {
+								network: network.clone(),
+								sync_service: sync_service.clone(),
+								relay_chain_network: relay_chain_network.clone(),
+								relay_chain_fork_id: relay_chain_fork_id.clone(),
+								kademlia,
+								allow_private_ip,
+							},
 							relay_chain_interface.clone(),
 							&task_manager,
 							requests,
