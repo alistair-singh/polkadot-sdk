@@ -59,7 +59,9 @@ use std::{
 const LOG_TARGET: &str = "spec-msg";
 
 /// How often the own chain's peers are read from sync.
-const OWN_PEERS_INTERVAL: Duration = Duration::from_secs(30);
+const OWN_PEERS_INTERVAL: Duration = Duration::from_secs(5);
+/// How often while sync has no peers, as at startup, so a new node can backfill soon.
+const NO_OWN_PEERS_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Speculative messaging configuration.
 #[derive(Clone, Debug, Default)]
@@ -239,13 +241,14 @@ async fn read_own_peers<Block: NodeBlock>(
 	sync_service: Arc<SyncingService<Block>>,
 	own_peers: Arc<parking_lot::Mutex<Vec<PeerId>>>,
 ) {
-	let mut interval = tokio::time::interval(OWN_PEERS_INTERVAL);
 	loop {
-		interval.tick().await;
-		match sync_service.peers_info().await {
-			Ok(peers) => *own_peers.lock() = peers.into_iter().map(|(peer, _)| peer).collect(),
+		let peers: Vec<PeerId> = match sync_service.peers_info().await {
+			Ok(peers) => peers.into_iter().map(|(peer, _)| peer).collect(),
 			Err(_) => return,
-		}
+		};
+		let wait = if peers.is_empty() { NO_OWN_PEERS_INTERVAL } else { OWN_PEERS_INTERVAL };
+		*own_peers.lock() = peers;
+		tokio::time::sleep(wait).await;
 	}
 }
 
