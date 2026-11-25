@@ -1276,6 +1276,8 @@ async fn late_node_steps(
 		return Err(anyhow!("{LATE_NODE} never logged \"{up}\""));
 	}
 	receiver_collator.resume().await?;
+	// The pause dropped the RPC connection to the receiver collator.
+	let receiver: OnlineClient<PolkadotConfig> = receiver_collator.wait_client().await?;
 
 	wait_opened(&sender, &receiver, RECEIVER).await?;
 	log::info!("The `Hello` from #{hello} was consumed: the channel is open");
